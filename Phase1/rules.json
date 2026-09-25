@@ -1,0 +1,13 @@
+{
+  "interfaces": {
+    "WAN1": { "name": "", "friendlyName": "WAN1" },
+    "WAN2": { "name": "", "friendlyName": "WAN2" }
+  },
+  "rules": [],
+  "health": {
+    "intervalSeconds": 3,
+    "failureThreshold": 3,
+    "recoverySuccessThreshold": 3,
+    "targets": ["1.1.1.1:443", "8.8.8.8:443"]
+  }
+}

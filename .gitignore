@@ -1,0 +1,8 @@
+**/bin/
+**/obj/
+**/logs/
+**/dualwan-state.json
+.vs/
+artifacts/
+*.user
+build-profile/
