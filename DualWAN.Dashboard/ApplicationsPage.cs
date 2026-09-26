@@ -21,9 +21,12 @@ using Orientation = System.Windows.Controls.Orientation;
 
 namespace DualWAN.Dashboard;
 
+// Applications combines individual rules and group membership into the
+// effective policy shown to users; Service policy remains authoritative.
 public partial class MainWindow
 {
     private readonly ObservableCollection<ApplicationRow> _applications = [];
+    // Cache process visuals and bound concurrent icon loads on the UI side.
     private readonly Dictionary<string, ResolvedApplicationVisual> _applicationVisualCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _applicationVisualLoads = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _applicationIconLimit = new(4);

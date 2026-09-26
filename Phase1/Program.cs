@@ -14,6 +14,8 @@ using NetBinder.Shared.Models;
 
 const string ServiceName = "DualWANService";
 var debug = args.Contains("--debug", StringComparer.OrdinalIgnoreCase);
+// LocalSystem owns the machine-wide configuration and telemetry under ProgramData.
+// The Dashboard is a user process and reaches this state through the control pipe.
 var dataRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "DualWAN");
 var paths = new RuntimePaths(dataRoot, Path.Combine(dataRoot, "config.json"), Path.Combine(dataRoot, "logs"),
     Path.Combine(dataRoot, "state", "dualwan-state.json"), Path.Combine(dataRoot, "data", "telemetry.db"));
@@ -66,9 +68,14 @@ static void CleanupOwnedProcess(string statePath)
     File.Delete(statePath);
 }
 
+/// <summary>
+/// Owns the Service control plane and the optional routing engine. Missing WAN bindings
+/// are a valid state: IPC stays available so the Dashboard can complete first-run setup.
+/// </summary>
 sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
 {
     private readonly RuntimeOptions _options;
+    // Serializes IPC configuration writes with the background WAN rediscovery cycle.
     private readonly SemaphoreSlim _configurationGate = new(1, 1);
     private readonly CancellationTokenSource _retryCancellation = new();
     private Task? _retryTask;
@@ -94,6 +101,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
         Console.WriteLine($"Version={version}; PID={Environment.ProcessId}; Mode={(_options.IsService ? "SERVICE" : "CONSOLE")}");
         Console.WriteLine($"Configuration path={_options.Paths.Config}");
         PrepareStateFile();
+        // Start IPC before reading configuration, including when routing cannot start.
         _ipc = new ControlPipeServer(this, _options.PipeName);
         await _ipc.StartAsync();
         if (File.Exists(_options.Paths.Config))
@@ -127,6 +135,8 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
 
     private async Task<bool> ActivateRoutingAsync(Config config)
     {
+        // The Service can be ready for control requests while these routing-owned
+        // components are absent. Telemetry storage is optional to packet forwarding.
         try
         {
             var wanMap = DiscoverWans(config);
@@ -167,6 +177,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
             catch (Exception ex)
             {
                 _history = null;
+                // Historical storage must never prevent an otherwise healthy engine from routing.
                 Console.WriteLine($"TELEMETRY DATABASE ERROR: {ex.GetType().Name}: {ex.Message}; routing continues");
             }
             var runState = new RunState(Environment.ProcessId, Environment.ProcessPath!,
@@ -185,6 +196,8 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
 
     private async Task RetryUnavailableWansAsync(CancellationToken cancellationToken)
     {
+        // Re-resolve adapter addresses after startup. A changed binding requires a
+        // routing restart; active sessions are closed, not migrated to the new WAN.
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
         try
         {
@@ -233,6 +246,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
         if (_stopped) return;
         _stopped = true;
         if (requested) Console.WriteLine("SERVICE STOP REQUESTED");
+        // Stop accepting control requests before disposing routing-owned state.
         if (_ipc is not null) await _ipc.DisposeAsync();
         await StopRoutingAsync();
         Console.WriteLine("SERVICE STOPPED");
@@ -240,6 +254,8 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
 
     private async Task StopRoutingAsync()
     {
+        // The Service and pipe may outlive the engine. Dispose consumers before their
+        // WAN health and relay dependencies, then clear the process ownership marker.
         if (_history is not null) { await _history.DisposeAsync(); _history = null; }
         _redirector?.Stop();
         _redirector = null;
@@ -281,6 +297,8 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
         foreach (var requested in config.Interfaces)
         {
             var spec = requested.Value;
+            // InterfaceId is the stable identity for new configurations; name-only
+            // matching remains for configurations written before IDs were stored.
             var nic = !string.IsNullOrWhiteSpace(spec.InterfaceId)
                 ? nics.SingleOrDefault(x => x.Id.Equals(spec.InterfaceId, StringComparison.OrdinalIgnoreCase))
                 : nics.SingleOrDefault(x => x.Name.Equals(spec.Name, StringComparison.OrdinalIgnoreCase));
@@ -322,6 +340,8 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
 
     private static List<ProcessRoutingPolicy> LoadPolicies(Config config, Dictionary<string, BindingMapping> wans)
     {
+        // Active individual rules win over group membership for the same executable.
+        // LAN bypass is evaluated earlier by RedirectorService, before these policies.
         var result = new List<ProcessRoutingPolicy>();
         var activeIndividuals = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var rule in config.Rules)
@@ -456,6 +476,8 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
     public async Task<ControlResult> SetWanConfigurationAsync(ControlWanSelection wan1, ControlWanSelection wan2,
         CancellationToken cancellationToken)
     {
+        // Friendly names are presentation only; persist selected interface IDs and
+        // reject duplicate physical adapters before changing active routing state.
         if (string.IsNullOrWhiteSpace(wan1.InterfaceId) || string.IsNullOrWhiteSpace(wan2.InterfaceId))
             return ControlResult.Error("INTERFACE_REQUIRED", "Select both WAN interfaces.");
         if (wan1.InterfaceId.Equals(wan2.InterfaceId, StringComparison.OrdinalIgnoreCase))
@@ -516,6 +538,8 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
     private async Task ApplyActiveWanConfigurationAsync(Config candidate,
         Dictionary<string, BindingMapping> resolved, List<ProcessRoutingPolicy> policies)
     {
+        // Replace the binding snapshot for new flows without moving existing TCP/UDP
+        // sessions. The old health worker stays alive until replacement succeeds.
         var hc = candidate.Health ?? new HealthConfig(3, 3, 3, ["1.1.1.1:443", "8.8.8.8:443"]);
         var replacement = new WanHealthService(resolved,
             new HealthSettings(hc.IntervalSeconds, hc.FailureThreshold, hc.RecoverySuccessThreshold, hc.Targets),
@@ -900,6 +924,8 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
 
     private void PersistAtomically(Config config)
     {
+        // Only the Service writes ProgramData config; replace a validated temporary
+        // file so a failed write cannot leave a partial JSON document.
         string directory = Path.GetDirectoryName(_options.Paths.Config)!;
         string temporary = Path.Combine(directory, $"config.{Guid.NewGuid():N}.tmp");
         try
@@ -931,6 +957,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
     }
 }
 
+/// <summary>Serializes concurrent Service log writes through one drain task.</summary>
 sealed class ProductLogger : TextWriter
 {
     private readonly TextWriter _console;

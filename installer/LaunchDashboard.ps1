@@ -11,6 +11,7 @@ try {
         throw 'Dashboard executable not found.'
     }
 
+    # ShellExecute hands the post-install launch to the interactive shell.
     $shell = New-Object -ComObject Shell.Application
     $shell.ShellExecute($DashboardPath, '',
         [System.IO.Path]::GetDirectoryName($DashboardPath), 'open', 1)

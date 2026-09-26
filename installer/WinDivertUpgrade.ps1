@@ -50,6 +50,8 @@ function Copy-DriverFile([string]$From, [string]$To) {
 }
 
 function Copy-DriverWithRetry([string]$From, [string]$To, [int]$MaxAttempts = 3, [int]$DelayMilliseconds = 500) {
+    # Driver unload can finish shortly after the service reports Stopped;
+    # retry the replacement a bounded number of times before failing setup.
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         try {
             Copy-DriverFile $From $To
@@ -62,6 +64,8 @@ function Copy-DriverWithRetry([string]$From, [string]$To, [int]$MaxAttempts = 3,
 }
 
 function Invoke-WinDivertUpgrade([string]$Operation, [string]$From, [string]$To) {
+    # Stop our packet owner first, then the shared driver service. Do not
+    # replace the .sys file while either may still hold a WinDivert handle.
     Stop-And-Wait 'DualWANService'
     Stop-And-Wait 'WinDivert'
     if ($Operation -eq 'Install') {

@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 
 namespace NetBinder.Service.Services;
 
+/// <summary>A Windows IPv4 route snapshot entry; OnLink distinguishes direct delivery from a gateway.</summary>
 public readonly record struct LocalIpv4Route(IPAddress Network, IPAddress Mask, int InterfaceIndex,
     bool OnLink, uint Metric = 0);
 
@@ -15,6 +16,7 @@ public interface ILocalIpv4RouteSource
     IReadOnlyList<LocalIpv4Route> ReadRoutes();
 }
 
+/// <summary>Reads active-adapter IPv4 routes from the Windows routing table.</summary>
 public sealed class WindowsLocalIpv4RouteSource : ILocalIpv4RouteSource
 {
     private const uint ErrorInsufficientBuffer = 122;
@@ -32,6 +34,8 @@ public sealed class WindowsLocalIpv4RouteSource : ILocalIpv4RouteSource
 
     public IReadOnlyList<LocalIpv4Route> ReadRoutes()
     {
+        // GetIpForwardTable exposes network-order addresses in a native row layout;
+        // copy them into managed IPAddress values before releasing its buffer.
         var active = new HashSet<int>();
         foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces())
         {
@@ -71,6 +75,10 @@ public sealed class WindowsLocalIpv4RouteSource : ILocalIpv4RouteSource
     }
 }
 
+/// <summary>
+/// Keeps directly reachable IPv4 destinations on the Windows path before any
+/// per-application Internet policy is evaluated by the redirector.
+/// </summary>
 public sealed class LocalDestinationClassifier(ILocalIpv4RouteSource source)
 {
     private readonly record struct RouteMatch(uint Network, uint Mask, int Prefix, bool OnLink, uint Metric);
@@ -78,6 +86,8 @@ public sealed class LocalDestinationClassifier(ILocalIpv4RouteSource source)
 
     public void Refresh()
     {
+        // Publish a complete immutable route snapshot to the packet thread. On
+        // refresh failure, an empty snapshot avoids treating unknown routes as LAN.
         try
         {
             var routes = source.ReadRoutes()
@@ -104,6 +114,7 @@ public sealed class LocalDestinationClassifier(ILocalIpv4RouteSource source)
         if (destination.AddressFamily != AddressFamily.InterNetwork) return false;
         Span<byte> bytes = stackalloc byte[4];
         destination.TryWriteBytes(bytes, out _);
+        // These scopes must stay local even when no usable route-table row exists.
         if (bytes[0] == 127 || (bytes[0] == 169 && bytes[1] == 254) ||
             (bytes[0] >= 224 && bytes[0] <= 239) || destination.Equals(IPAddress.Broadcast)) return true;
 
@@ -111,6 +122,8 @@ public sealed class LocalDestinationClassifier(ILocalIpv4RouteSource source)
         int bestPrefix = -1;
         uint bestMetric = uint.MaxValue;
         bool bestOnLink = false;
+        // Windows selects the most-specific route, then lowest metric. A gateway
+        // route at that precedence must not be mistaken for an on-link destination.
         foreach (RouteMatch route in Volatile.Read(ref _routes))
         {
             if ((address & route.Mask) != route.Network) continue;

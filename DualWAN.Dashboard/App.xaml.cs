@@ -9,6 +9,10 @@ using Application = System.Windows.Application;
 
 namespace DualWAN.Dashboard;
 
+/// <summary>
+/// Owns Dashboard process lifetime, single-instance activation and the short-lived
+/// elevated helper modes used for Service control and mutating IPC.
+/// </summary>
 public partial class App : Application
 {
     private Mutex? _instanceMutex;
@@ -52,6 +56,8 @@ public partial class App : Application
             return;
         }
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
+        // A second launch signals the first process; tray hiding does not release
+        // the mutex or destroy its MainWindow.
         _activationEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ActivationEvent);
         var window = new MainWindow();
         MainWindow = window;
@@ -85,6 +91,8 @@ public partial class App : Application
 
     private static async Task<int> RunWriteHelperAsync(string encodedRequest)
     {
+        // The helper allowlist limits what an elevated Dashboard invocation can
+        // request; the LocalSystem Service independently authorizes the pipe caller.
         try
         {
             string request = Encoding.UTF8.GetString(Convert.FromBase64String(encodedRequest));
@@ -121,6 +129,7 @@ public partial class App : Application
 
 internal enum DualWanServiceState { Unknown=0, Stopped=1, StartPending=2, StopPending=3, Running=4 }
 
+/// <summary>Minimal Service Control Manager access for Dashboard status and UAC helper actions.</summary>
 internal static class WindowsServiceControl
 {
     private const string ServiceName="DualWANService";
