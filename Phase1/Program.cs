@@ -89,7 +89,8 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
     private Dictionary<string, BindingMapping> _wanMap = new(StringComparer.OrdinalIgnoreCase);
     private List<ProcessRoutingPolicy> _policies = [];
     private Config? _config;
-    private bool _engineReady;
+    private volatile bool _engineReady;
+    private bool RoutingReady => _engineReady && _redirector?.IsRunning == true;
     private bool _stopped;
 
     public DualWanRuntime(RuntimeOptions options) => _options = options;
@@ -106,6 +107,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
         await _ipc.StartAsync();
         if (File.Exists(_options.Paths.Config))
         {
+            await _configurationGate.WaitAsync(cancellationToken);
             try
             {
                 _config = ReadConfig();
@@ -117,6 +119,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
                 await StopRoutingAsync();
                 Console.WriteLine($"CONFIGURATION ERROR: {ex.GetType().Name}: {ex.Message}; routing engine inactive");
             }
+            finally { _configurationGate.Release(); }
         }
         else Console.WriteLine("CONFIGURATION REQUIRED: routing engine inactive");
         _retryTask = Task.Run(() => RetryUnavailableWansAsync(_retryCancellation.Token));
@@ -139,6 +142,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
         // components are absent. Telemetry storage is optional to packet forwarding.
         try
         {
+            if (_redirector is not null && !_redirector.IsRunning) await StopRoutingAsync();
             var wanMap = DiscoverWans(config);
             _config = config;
             _wanMap = wanMap;
@@ -159,12 +163,13 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
             Console.WriteLine("Health service started");
             _udpRelay = new UdpRelay();
             Console.WriteLine("UDP relay started");
-            _redirector = new RedirectorService(_udpRelay);
+            _redirector = new RedirectorService(_udpRelay, OnRedirectorFailure);
             _relay = new TransparentProxy(_redirector.GetNATMapping);
             if (!_relay.Start()) throw new InvalidOperationException("TCP relay failed to start.");
             Console.WriteLine($"TCP relay started on 127.0.0.1:{_relay.ListenPort}");
             _redirector.UpdateBindings(wanMap.Values, policies, _health);
             if (!_redirector.Start(_relay.ListenPort)) throw new InvalidOperationException("WinDivert failed to start.");
+            if (!_redirector.IsRunning) throw new InvalidOperationException("WinDivert packet loop stopped during startup.");
             Console.WriteLine("WinDivert started");
             _policies = policies;
             _engineReady = true;
@@ -183,6 +188,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
             var runState = new RunState(Environment.ProcessId, Environment.ProcessPath!,
                 Process.GetCurrentProcess().StartTime.ToUniversalTime().Ticks);
             File.WriteAllText(_options.Paths.State, JsonSerializer.Serialize(runState));
+            if (!_redirector.IsRunning) throw new InvalidOperationException("WinDivert packet loop stopped during startup.");
             Console.WriteLine($"SERVICE READY: WANs={wanMap.Count}; rules={policies.Count}; WinDivert=2.2");
             return true;
         }
@@ -192,6 +198,23 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
             Console.WriteLine($"ROUTING START ERROR: {ex.GetType().Name}: {ex.Message}");
             throw;
         }
+    }
+
+    private void OnRedirectorFailure(RedirectorService failed)
+    {
+        if (!ReferenceEquals(_redirector, failed)) return;
+        _engineReady = false;
+        Console.WriteLine("PACKET LOOP FAILURE: routing engine inactive; WinDivert interception released");
+        _ = Task.Run(async () =>
+        {
+            await _configurationGate.WaitAsync();
+            try
+            {
+                if (ReferenceEquals(_redirector, failed)) await StopRoutingAsync();
+            }
+            catch (Exception ex) { Console.WriteLine($"ROUTING CLEANUP ERROR: {ex}"); }
+            finally { _configurationGate.Release(); }
+        });
     }
 
     private async Task RetryUnavailableWansAsync(CancellationToken cancellationToken)
@@ -206,6 +229,8 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
                 await _configurationGate.WaitAsync(cancellationToken);
                 try
                 {
+                    if (!_engineReady && _redirector is not null && !_redirector.IsRunning)
+                        await StopRoutingAsync();
                     if (!_engineReady && _config is not null && HasWanBindings(_config))
                         try { await ActivateRoutingAsync(_config); }
                         catch (Exception ex) { Console.WriteLine($"WAN retry deferred: {ex.Message}"); }
@@ -248,12 +273,15 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
         if (requested) Console.WriteLine("SERVICE STOP REQUESTED");
         // Stop accepting control requests before disposing routing-owned state.
         if (_ipc is not null) await _ipc.DisposeAsync();
-        await StopRoutingAsync();
+        await _configurationGate.WaitAsync();
+        try { await StopRoutingAsync(); }
+        finally { _configurationGate.Release(); }
         Console.WriteLine("SERVICE STOPPED");
     }
 
     private async Task StopRoutingAsync()
     {
+        _engineReady = false;
         // The Service and pipe may outlive the engine. Dispose consumers before their
         // WAN health and relay dependencies, then clear the process ownership marker.
         if (_history is not null) { await _history.DisposeAsync(); _history = null; }
@@ -391,12 +419,12 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
         service = "RUNNING",
         version = Assembly.GetEntryAssembly()?.GetName().Version?.ToString() ?? "unknown",
         uptimeSeconds = (long)(DateTimeOffset.Now - _startedAt).TotalSeconds,
-        engine = _engineReady ? "READY" : "INACTIVE",
-        routingEngineReady = _engineReady,
-        winDivert = _redirector?.IsRunning == true ? "RUNNING" : "STOPPED",
-        tcpRelay = _relay is not null && _engineReady ? "RUNNING" : "STOPPED",
-        udpRelay = _udpRelay is not null && _engineReady ? "RUNNING" : "STOPPED",
-        healthWorker = _health is not null && _engineReady ? "RUNNING" : "STOPPED",
+        engine = RoutingReady ? "READY" : "INACTIVE",
+        routingEngineReady = RoutingReady,
+        winDivert = RoutingReady ? "RUNNING" : "STOPPED",
+        tcpRelay = _relay is not null && RoutingReady ? "RUNNING" : "STOPPED",
+        udpRelay = _udpRelay is not null && RoutingReady ? "RUNNING" : "STOPPED",
+        healthWorker = _health is not null && RoutingReady ? "RUNNING" : "STOPPED",
         activeFlows = _redirector?.ActiveFlowCount ?? 0
     };
 
@@ -409,7 +437,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
             ifIndex = x.Value.InterfaceIndex,
             ipv4 = x.Value.InterfaceIpv4,
             gateway = x.Value.GatewayIpv4,
-            state = _engineReady && x.Value.IsActive
+            state = RoutingReady && x.Value.IsActive
                 ? (_health?.GetState(x.Key) ?? WanHealthState.Checking).ToString().ToUpperInvariant()
                 : "DOWN",
             role = "POLICY_DEPENDENT"
@@ -440,7 +468,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
     {
         wan1 = WanConfiguration("WAN1"),
         wan2 = WanConfiguration("WAN2"),
-        active = _engineReady
+        active = RoutingReady
     };
 
     private object WanConfiguration(string key)
@@ -453,7 +481,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
             interfaceName = spec?.Name ?? "",
             friendlyName = string.IsNullOrWhiteSpace(spec?.FriendlyName) ? key : spec.FriendlyName,
             state = _wanMap.TryGetValue(key, out var wan)
-                ? _engineReady && wan.IsActive ? (_health?.GetState(key) ?? WanHealthState.Checking).ToString().ToUpperInvariant() : "DOWN"
+                ? RoutingReady && wan.IsActive ? (_health?.GetState(key) ?? WanHealthState.Checking).ToString().ToUpperInvariant() : "DOWN"
                 : "UNCONFIGURED"
         };
     }
@@ -659,7 +687,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
             {
                 id = x.Key,
                 name = WanLabel(x.Key, x.Value.InterfaceName),
-                state = _engineReady && x.Value.IsActive
+                state = RoutingReady && x.Value.IsActive
                     ? (telemetry?.State ?? WanHealthState.Checking).ToString().ToUpperInvariant() : "DOWN",
                 ipv4 = x.Value.InterfaceIpv4,
                 ifIndex = x.Value.InterfaceIndex,
