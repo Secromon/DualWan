@@ -15,6 +15,7 @@ namespace NetBinder.Service.Services;
 public sealed record ControlRule(string Process, string Wan, string Mode, bool Enabled);
 public sealed record ControlGroup(string Name, string Wan, string Mode, bool Enabled,
     IReadOnlyList<string> Applications);
+/// <summary>Stable adapter identity and a display-only label requested by the Dashboard.</summary>
 public sealed record ControlWanSelection(string InterfaceId, string FriendlyName);
 public sealed record ControlResult(bool Success, object? Data = null, string? ErrorCode = null, string? ErrorMessage = null)
 {
@@ -22,6 +23,7 @@ public sealed record ControlResult(bool Success, object? Data = null, string? Er
     public static ControlResult Error(string code, string message) => new(false, null, code, message);
 }
 
+/// <summary>Service-owned operations exposed through the versioned local pipe contract.</summary>
 public interface IDualWanControlPlane
 {
     object GetStatus();
@@ -46,6 +48,10 @@ public interface IDualWanControlPlane
         CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// Serves newline-delimited JSON requests on a local named pipe. Read commands are
+/// available to the user Dashboard; mutating commands require an administrator token.
+/// </summary>
 public sealed class ControlPipeServer : IAsyncDisposable
 {
     public const string PipeName = "DualWAN.Control";
@@ -104,6 +110,8 @@ public sealed class ControlPipeServer : IAsyncDisposable
 
     private NamedPipeServerStream CreatePipe()
     {
+        // Pipe access lets normal users read status. Authorization for writes is
+        // checked separately by impersonating the client on each mutating request.
         var security = new PipeSecurity();
         const PipeAccessRights localClientRights = PipeAccessRights.ReadWrite |
             PipeAccessRights.CreateNewInstance | PipeAccessRights.Synchronize;
@@ -155,6 +163,9 @@ public sealed class ControlPipeServer : IAsyncDisposable
 
     private async Task<object> ProcessRequestAsync(NamedPipeServerStream pipe, string line, CancellationToken cancellationToken)
     {
+        // Every response echoes requestId and apiVersion, including validation errors.
+        // Invalid client input stays on the pipe; Service operation failures are
+        // returned by the control plane as stable error codes.
         string requestId = "";
         try
         {
@@ -300,6 +311,8 @@ public sealed class ControlPipeServer : IAsyncDisposable
     private async Task<ControlResult> SetWanConfigurationAsync(NamedPipeServerStream pipe, JsonElement root,
         CancellationToken cancellationToken)
     {
+        // A WAN write changes machine-wide routing and ProgramData configuration,
+        // so accepting it from an unelevated Dashboard would cross the trust boundary.
         if (!IsMutationAuthorized(pipe)) return ControlResult.Error("UNAUTHORIZED", "Administrator rights are required.");
         if (!root.TryGetProperty("wan1", out var first) || first.ValueKind != JsonValueKind.Object ||
             !root.TryGetProperty("wan2", out var second) || second.ValueKind != JsonValueKind.Object)
@@ -319,6 +332,7 @@ public sealed class ControlPipeServer : IAsyncDisposable
 
     private static bool IsMutationAuthorized(NamedPipeServerStream pipe)
     {
+        // Inspect the connected caller, not the LocalSystem identity of this Service.
         bool authorized = false;
         try
         {
@@ -375,6 +389,7 @@ public sealed class ControlPipeServer : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // Closing active pipes releases readers blocked on I/O before awaiting clients.
         _cts.Cancel();
         foreach (var pipe in _pipes.Values) pipe.Dispose();
         if (_acceptLoop is not null)

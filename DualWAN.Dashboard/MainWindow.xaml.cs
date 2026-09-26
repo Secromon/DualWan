@@ -31,9 +31,14 @@ using ColorConverter = System.Windows.Media.ColorConverter;
 
 namespace DualWAN.Dashboard;
 
+/// <summary>
+/// Coordinates Dashboard navigation, presentation and Service control. Routing
+/// state and configuration remain owned by the Service behind the local IPC API.
+/// </summary>
 public partial class MainWindow : Window
 {
     private const string PipeName = "DualWAN.Control";
+    // Refresh guards keep timer ticks and tab requests from overlapping UI updates.
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly LocalizationService _loc = new();
     private readonly ObservableCollection<RuleRow> _rules = [];
@@ -49,6 +54,8 @@ public partial class MainWindow : Window
     private string? _currentPreset;
     private int? _historyPointCount;
     private JsonElement? _lastTelemetry;
+    // Retained presentation state lets language/theme changes redraw without
+    // waiting for the next Service response.
     private bool _online;
     private readonly string[] _wanStates = ["UNKNOWN", "UNKNOWN"];
     private bool _exitRequested;
@@ -57,6 +64,9 @@ public partial class MainWindow : Window
     private readonly Forms.ToolStripMenuItem _trayService = new();
     private readonly Forms.ToolStripMenuItem _trayExit = new();
 
+    // -----------------------------------------------------------------------------
+    // Startup and tray lifetime
+    // -----------------------------------------------------------------------------
     public MainWindow()
     {
         InitializeComponent();
@@ -115,6 +125,9 @@ public partial class MainWindow : Window
         DashboardStartup.IsEnabled = StartupCheck.IsChecked == true;
     }
 
+    // -----------------------------------------------------------------------------
+    // Service refresh and read-only IPC
+    // -----------------------------------------------------------------------------
     private async Task RefreshAsync()
     {
         if (_refreshing) return;
@@ -139,6 +152,9 @@ public partial class MainWindow : Window
 
     private static async Task<JsonElement> SendRequestAsync(object request)
     {
+        // Bound each read to two seconds so a stopped or unresponsive Service
+        // cannot hold the UI refresh loop indefinitely. Requests are one line;
+        // the response is one JSON line with a success flag and data payload.
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
         using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
         await pipe.ConnectAsync(timeout.Token);
@@ -167,6 +183,7 @@ public partial class MainWindow : Window
         }
     }
 
+    // WAN presentation uses Service-provided state; labels remain localizable here.
     private void RenderWan(JsonElement wan, int number)
     {
         string id = wan.GetProperty("id").GetString() ?? $"WAN{number}";
@@ -211,6 +228,8 @@ public partial class MainWindow : Window
         txTotal.Text = $"TX {FormatBytes(GetDouble(wan, "txTotalBytes"), false)}";
     }
 
+    // Navigation loads page data on demand; Applications and Help are implemented
+    // in the other MainWindow partial files.
     private async void MainTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (!ReferenceEquals(e.Source, MainTabs)) return;
@@ -224,6 +243,9 @@ public partial class MainWindow : Window
         if (MainTabs.SelectedIndex == 7) RefreshHelp();
     }
 
+    // -----------------------------------------------------------------------------
+    // Rules and groups
+    // -----------------------------------------------------------------------------
     private async void RefreshRules_Click(object sender, RoutedEventArgs e) => await RefreshRulesAsync();
 
     private async Task RefreshRulesAsync()
@@ -408,6 +430,7 @@ public partial class MainWindow : Window
         });
     }
 
+    // Presets change group policy while individual rules retain precedence.
     private async void Preset_Click(object sender, RoutedEventArgs e)
     {
         if ((sender as FrameworkElement)?.Tag is not string presetId) return;
@@ -447,8 +470,13 @@ public partial class MainWindow : Window
         });
     }
 
+    // -----------------------------------------------------------------------------
+    // Mutating IPC: an elevated Dashboard helper performs writes
+    // -----------------------------------------------------------------------------
     private async Task<bool> RunWriteAsync(object request, bool wanConfiguration = false)
     {
+        // The normal Dashboard process stays unelevated. UAC launches a short-lived
+        // helper, and the Service still verifies the pipe client's administrator token.
         string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(request)));
         try
         {
@@ -493,6 +521,9 @@ public partial class MainWindow : Window
         }
     }
 
+    // -----------------------------------------------------------------------------
+    // Historical telemetry and storage settings
+    // -----------------------------------------------------------------------------
     private async void HistoryRefresh_Click(object sender, RoutedEventArgs e) => await LoadHistoryAsync();
 
     private async void HistoryFilter_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -554,11 +585,16 @@ public partial class MainWindow : Window
         catch { StorageStatus.Text=_loc.Text("common.offline"); }
     }
 
+    // -----------------------------------------------------------------------------
+    // First-run WAN configuration
+    // -----------------------------------------------------------------------------
     private async Task LoadWanSettingsAsync()
     {
         if (_wanSettingsSaving) return;
         try
         {
+            // Interface IDs identify adapters across rename; names and friendly
+            // labels are for display, including an unavailable saved choice.
             JsonElement available = await SendReadAsync("getAvailableInterfaces");
             JsonElement config = await SendReadAsync("getWanConfiguration");
             var choices = available.GetProperty("interfaces").EnumerateArray()
@@ -595,6 +631,7 @@ public partial class MainWindow : Window
     {
         string id = configured.GetProperty("interfaceId").GetString() ?? "";
         string name = configured.GetProperty("interfaceName").GetString() ?? "";
+        // Name-only bindings from older configurations remain selectable.
         if (id.Length == 0 && name.Length > 0)
             id = choices.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase))?.Id ?? "";
         selector.SelectedValue = id.Length == 0 ? null : id;
@@ -603,6 +640,8 @@ public partial class MainWindow : Window
 
     private async void SaveWanConfiguration_Click(object sender, RoutedEventArgs e)
     {
+        // Reject selecting the same adapter twice before invoking the elevated
+        // write path; the Service validates the IDs again against current NICs.
         string first = Wan1InterfaceSelect.SelectedValue as string ?? "";
         string second = Wan2InterfaceSelect.SelectedValue as string ?? "";
         if (first.Length == 0 || second.Length == 0)
@@ -652,6 +691,9 @@ public partial class MainWindow : Window
         await RunWriteAsync(new{apiVersion=1,requestId=Guid.NewGuid().ToString("N"),command="setTelemetryStoragePolicy",retentionDays=days,maximumBytes=b=="unlimited"?(long?)null:long.Parse(b)});
     }
     private async void CleanHistory_Click(object sender,RoutedEventArgs e)=>await RunWriteAsync(new{apiVersion=1,requestId=Guid.NewGuid().ToString("N"),command="cleanTelemetry"});
+    // -----------------------------------------------------------------------------
+    // Navigation, theme and language rendering
+    // -----------------------------------------------------------------------------
     private void LanguageSelect_SelectionChanged(object sender,SelectionChangedEventArgs e){if(LanguageSelect.SelectedValue is string code&&code!=_loc.CurrentCode){_loc.Select(code);ApplyLanguage();}}
     private void ThemeSelect_SelectionChanged(object sender,SelectionChangedEventArgs e){if(ThemeSelect.SelectedValue is string theme&&theme!=_loc.CurrentTheme){_loc.SelectTheme(theme);ApplyTheme();}}
     private void Navigate_Click(object sender,RoutedEventArgs e){if(MainTabs is null)return;if(sender is FrameworkElement element&&int.TryParse(element.Tag?.ToString(),out int index))MainTabs.SelectedIndex=index;}
@@ -729,6 +771,9 @@ public partial class MainWindow : Window
         UpdateNavigation();
     }
 
+    // -----------------------------------------------------------------------------
+    // Windows Service control and status presentation
+    // -----------------------------------------------------------------------------
     private async void ServiceControl_Click(object sender,RoutedEventArgs e)
     {
         if(_serviceOperation)return;
@@ -848,6 +893,9 @@ public partial class MainWindow : Window
             : $"{value.Minutes}m {value.Seconds}s";
     }
 
+    // -----------------------------------------------------------------------------
+    // Page models and editor dialogs
+    // -----------------------------------------------------------------------------
     public sealed record WanChoice(string Id, string Display);
     private sealed record WanInterfaceChoice(string Id, string Name, string Display);
     public sealed record RuleRow(string Process, string Wan, string WanDisplay, string Mode, bool Enabled, string EnabledLabel)

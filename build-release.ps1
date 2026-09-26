@@ -9,6 +9,8 @@ $compiler = 'C:\Program Files (x86)\NSIS\makensis.exe'
 if (-not (Test-Path $compiler)) { throw 'NSIS makensis.exe is required.' }
 $stage = Join-Path $root "artifacts\stage\$version"
 $release = Join-Path $root "artifacts\release\$version"
+# Stage self-contained binaries before NSIS packaging; the stage and release
+# directories are build outputs and are not part of the published source tree.
 New-Item -ItemType Directory -Force $stage,$release | Out-Null
 & (Join-Path $root 'scripts\generate-icon.ps1')
 $originalAppData = $env:APPDATA

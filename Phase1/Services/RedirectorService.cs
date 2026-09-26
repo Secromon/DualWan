@@ -91,6 +91,8 @@ public class RedirectorService : IDisposable
     public long FailbackCount => Interlocked.Read(ref _failbacks);
     public long StrictFailureCount => Interlocked.Read(ref _strictFailures);
     private readonly object _bindingsLock = new();
+    // Protects the mutable policy/binding snapshot and last-WAN decisions from
+    // IPC updates while the WinDivert thread classifies new packets.
 
     // Windows loopback interface index is always 1
     private const uint LOOPBACK_IFIDX = 1;
@@ -722,6 +724,8 @@ public class RedirectorService : IDisposable
 
     private RoutingDecision ResolveRouting(string? exePath, IPAddress destination)
     {
+        // Precedence is LAN bypass > individual rule > active group > Windows
+        // passthrough. Directly reachable LAN traffic never enters WAN selection.
         if (_localDestinations.IsLocalDestination(destination))
             return new(false, null, null, WanHealthState.Checking, false, false, "LOCAL_BYPASS");
         if (string.IsNullOrEmpty(exePath)) return new(false, null, null, WanHealthState.Checking, false, false, "NO_POLICY");
@@ -736,6 +740,8 @@ public class RedirectorService : IDisposable
                 x.Match.Equals("INDIVIDUAL", StringComparison.OrdinalIgnoreCase))
                 ?? _policies.FirstOrDefault(Matches);
             if (policy is null) return new(false, null, null, WanHealthState.Checking, false, false, "NO_POLICY");
+            // Health is sampled for each new flow. STRICT never uses the secondary;
+            // FAILOVER can use it only after health has confirmed it UP.
             var primaryState = _health?.GetState(policy.PrimaryWan) ?? WanHealthState.Checking;
             if (primaryState == WanHealthState.Up && _wanBindings.TryGetValue(policy.PrimaryWan, out var primary))
             {

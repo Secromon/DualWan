@@ -53,6 +53,8 @@ Section "DualWAN application and service" SecMain
   nsExec::ExecToLog 'taskkill.exe /IM DualWAN.Dashboard.exe /F'
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
+  ; Unload and replace the driver before changing installed files. A locked
+  ; WinDivert driver aborts the upgrade instead of leaving mixed versions.
   File /oname=WinDivertUpgrade.ps1 "WinDivertUpgrade.ps1"
   File /oname=WinDivert64.sys "${STAGE}\Service\WinDivert64.sys"
   nsExec::ExecToStack 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\WinDivertUpgrade.ps1" -Mode Install -Source "$PLUGINSDIR\WinDivert64.sys" -Destination "$INSTDIR\Service\WinDivert64.sys"'
@@ -62,6 +64,7 @@ Section "DualWAN application and service" SecMain
     MessageBox MB_OK|MB_ICONSTOP "DualWAN could not unload or replace the WinDivert network driver. Close applications using WinDivert or restart Windows, then run the installer again.$\r$\n$1"
     Abort
   ${EndIf}
+  ; Preserve external language packs while refreshing bundled translations.
   CreateDirectory "$LOCALAPPDATA\DualWAN\Languages"
   IfFileExists "$INSTDIR\Dashboard\Languages\*.json" 0 +2
     CopyFiles /SILENT "$INSTDIR\Dashboard\Languages\*.json" "$LOCALAPPDATA\DualWAN\Languages"
@@ -76,6 +79,7 @@ Section "DualWAN application and service" SecMain
   SetOutPath "$INSTDIR\Dashboard\Languages"
   File "${STAGE}\Dashboard\Languages\en-US.json"
   File "${STAGE}\Dashboard\Languages\it-IT.json"
+  ; Service configuration remains in ProgramData and is not overwritten here.
   nsExec::ExecToStack 'sc.exe query DualWANService'
   Pop $0
   Pop $1
@@ -116,6 +120,8 @@ Section /o "Start Dashboard with Windows" SecStartup
 SectionEnd
 
 Function LaunchDashboard
+  ; The finish-page action delegates to the shell to start the Dashboard in
+  ; the interactive user session, outside the elevated installer process.
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
   File /oname=LaunchDashboard.ps1 "LaunchDashboard.ps1"

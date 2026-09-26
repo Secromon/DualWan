@@ -3,6 +3,8 @@ using System.Runtime.InteropServices;
 
 namespace NetBinder.Service.NativeInterop;
 
+// This explicit layout mirrors the native WinDivert address ABI. IfIdx and
+// loopback flags determine where rewritten packets are reinjected.
 [StructLayout(LayoutKind.Explicit, Size = 80)]
 public struct WINDIVERT_ADDRESS
 {

@@ -18,6 +18,8 @@ namespace DualWAN.Dashboard;
 
 public partial class MainWindow
 {
+    // Keep the last queried series for redraws after resize, theme or language
+    // changes; hover overlays belong to this window and its Dispatcher timer.
     private readonly Dictionary<string, JsonElement[]> _historySeries = new();
     private long _historyFrom, _historyTo;
     private readonly Dictionary<Canvas, (Border Border, TextBlock Text)> _historyTipOverlays = new();

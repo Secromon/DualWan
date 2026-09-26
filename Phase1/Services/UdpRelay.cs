@@ -9,6 +9,10 @@ namespace NetBinder.Service.Services;
 /// <summary>Per-flow UDP relay. Carries datagram payloads without inspecting them.</summary>
 public sealed class UdpRelay : IDisposable
 {
+    /// <summary>
+    /// Owns one bound outbound socket and one loopback socket for a UDP flow.
+    /// The binding is captured at creation; later WAN changes do not migrate it.
+    /// </summary>
     public sealed class Session : IDisposable
     {
         private readonly Socket _loopback;
