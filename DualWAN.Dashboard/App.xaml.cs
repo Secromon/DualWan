@@ -116,6 +116,12 @@ public partial class App : Application
                 "UNAUTHORIZED" => 4,
                 "PERSIST_FAILED" => 5,
                 "ENGINE_NOT_READY" => 2,
+                "GROUP_NAME_EXISTS" => 20,
+                "GROUP_NOT_FOUND" => 21,
+                "GROUP_MEMBERSHIP_CONFLICT" => 22,
+                "DUPLICATE_APPLICATION" => 23,
+                "INVALID_WAN" => 24,
+                "INVALID_MODE" => 25,
                 _ => 3
             };
         }
