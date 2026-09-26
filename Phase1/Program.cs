@@ -739,12 +739,31 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
             try
             {
                 ValidateGroupName(group.Name);
+                if (group.OriginalName is not null) ValidateGroupName(group.OriginalName);
                 foreach (string process in group.Applications) ValidateProcessName(process);
-                if (!_wanMap.ContainsKey(group.Wan)) throw new InvalidDataException($"Unknown WAN: {group.Wan}");
+                if (!_wanMap.ContainsKey(group.Wan))
+                    return ControlResult.Error(group.OriginalName is null ? "INVALID_GROUP" : "INVALID_WAN",
+                        $"Unknown WAN: {group.Wan}");
                 if (!Enum.TryParse<FailoverMode>(group.Mode, true, out _))
-                    throw new InvalidDataException("Mode must be STRICT or FAILOVER.");
+                    return ControlResult.Error(group.OriginalName is null ? "INVALID_GROUP" : "INVALID_MODE",
+                        "Mode must be STRICT or FAILOVER.");
                 var groups = (_config.Groups ?? []).Select(x => x with { Applications = [.. x.Applications] }).ToList();
-                int index = groups.FindIndex(x => x.Name.Equals(group.Name, StringComparison.OrdinalIgnoreCase));
+                string name = group.Name.Trim();
+                int index = groups.FindIndex(x => x.Name.Equals(group.OriginalName ?? name, StringComparison.OrdinalIgnoreCase));
+                if (group.OriginalName is not null)
+                {
+                    if (index < 0)
+                        return ControlResult.Error("GROUP_NOT_FOUND", $"No group exists with name {group.OriginalName}.");
+                    if (groups.Where((_, i) => i != index).Any(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+                        return ControlResult.Error("GROUP_NAME_EXISTS", $"A group named {name} already exists.");
+                    if (group.Applications.Count != group.Applications.Distinct(StringComparer.OrdinalIgnoreCase).Count())
+                        return ControlResult.Error("DUPLICATE_APPLICATION", "A group contains a duplicate application.");
+                    var otherMembers = groups.Where((_, i) => i != index)
+                        .SelectMany(x => x.Applications).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    if (group.Applications.Any(otherMembers.Contains))
+                        return ControlResult.Error("GROUP_MEMBERSHIP_CONFLICT", "An application already belongs to another group.");
+                }
+                string? previousName = index < 0 ? null : groups[index].Name;
                 var updated = new Group(group.Name.Trim(), group.Wan.ToUpperInvariant(),
                     group.Mode.ToUpperInvariant(), group.Enabled, group.Applications.ToList());
                 if (index < 0) groups.Add(updated); else groups[index] = updated;
@@ -754,7 +773,9 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
                 _redirector.UpdateBindings(_wanMap.Values, policies, _health);
                 _config = candidate;
                 _policies = policies;
-                Console.WriteLine($"IPC group {(index < 0 ? "created" : "changed")}: {group.Name}; applications={group.Applications.Count}");
+                if (previousName is not null && !previousName.Equals(name, StringComparison.Ordinal))
+                    Console.WriteLine($"IPC group renamed: {previousName} -> {name}");
+                else Console.WriteLine($"IPC group {(index < 0 ? "created" : "changed")}: {group.Name}; applications={group.Applications.Count}");
                 return ControlResult.Ok(new { created = index < 0, currentPreset = "Custom" });
             }
             catch (InvalidDataException ex) { return ControlResult.Error("INVALID_GROUP", ex.Message); }
