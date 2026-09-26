@@ -24,6 +24,8 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
 New-Item -ItemType Directory -Force -Path $InstallDirectory | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $programData 'logs') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $programData 'state') | Out-Null
+# Preserve an existing machine-wide configuration. The bundled neutral file
+# leaves WAN selection to the first-run Dashboard when no config exists.
 if (-not (Test-Path -LiteralPath $configPath)) {
     Copy-Item -LiteralPath $defaultConfig -Destination $configPath
 }

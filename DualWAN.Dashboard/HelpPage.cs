@@ -1,5 +1,7 @@
 namespace DualWAN.Dashboard;
 
+// Help text comes from the selected language pack; WAN labels are substituted
+// at render time so the page follows the current first-run configuration.
 public partial class MainWindow
 {
     private sealed record HelpSection(string Title, string Body);

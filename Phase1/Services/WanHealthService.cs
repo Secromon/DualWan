@@ -7,8 +7,14 @@ using NetBinder.Shared.Models;
 
 namespace NetBinder.Service.Services;
 
+/// <summary>
+/// Probe state: Checking is initial, Suspect precedes confirmed Down, and
+/// Recovering requires consecutive success before the WAN is eligible as Up.
+/// </summary>
 public enum WanHealthState { Checking, Up, Suspect, Down, Recovering }
+/// <summary>Strict uses only the preferred WAN; Failover permits a healthy secondary.</summary>
 public enum FailoverMode { Strict, Failover }
+/// <summary>Effective per-process choice, including its individual or group origin.</summary>
 public sealed record ProcessRoutingPolicy(string ProcessName, string PrimaryWan, FailoverMode Mode,
     string Match = "INDIVIDUAL");
 public sealed record HealthSettings(int IntervalSeconds, int FailureThreshold, int RecoverySuccessThreshold,
@@ -18,10 +24,16 @@ public sealed record WanTelemetrySnapshot(WanHealthState State, double? RxBytesP
     double? LatencyMinMs, double? LatencyAverageMs, double? LatencyMaxMs, long ProbeSuccesses,
     long ProbeFailures, double? ProbeLossPercent, long? UpSeconds);
 
+/// <summary>
+/// Probes each WAN independently and samples adapter traffic for live telemetry.
+/// State transitions affect routing decisions for newly created flows.
+/// </summary>
 public sealed class WanHealthService : IDisposable
 {
     private sealed class Status
     {
+        // Gate protects writes to probe state/counters and traffic deltas while
+        // telemetry snapshots are assembled for IPC readers.
         public readonly object Gate = new();
         public WanHealthState State = WanHealthState.Checking;
         public int Failures;
@@ -64,6 +76,7 @@ public sealed class WanHealthService : IDisposable
 
     public async Task StartAsync()
     {
+        // Establish initial counters and probe state before background cycles run.
         SampleTraffic();
         await ProbeCycleAsync(_cts.Token);
         _healthWorker = Task.Run(() => RunHealthAsync(_cts.Token));
@@ -159,6 +172,8 @@ public sealed class WanHealthService : IDisposable
     private void RecordProbes(string logicalWan, bool interfaceUp,
         List<(string Target, bool Success, long LatencyMs)> targets)
     {
+        // Loss is based on completed target probes, not inferred from traffic volume;
+        // latency aggregates only successful targets.
         var status = _status[logicalWan];
         lock (status.Gate)
         {
@@ -253,6 +268,8 @@ public sealed class WanHealthService : IDisposable
 
     private void Apply(string logicalWan, string interfaceName, bool interfaceUp, bool healthy)
     {
+        // Interface loss is immediately Down. Probe failures move Up through Suspect
+        // to Down; a Down WAN passes through Recovering before becoming Up again.
         var status = _status[logicalWan];
         WanHealthState previous;
         lock (status.Gate)

@@ -2,11 +2,17 @@ using Microsoft.Data.Sqlite;
 
 namespace NetBinder.Service.Services;
 
+/// <summary>A chart bucket containing traffic, latency, probe counts and WAN state.</summary>
 public sealed record HistoryPoint(long Timestamp, double RxAverage, double RxMaximum, double TxAverage,
     double TxMaximum, double? LatencyMinimum, double? LatencyAverage, double? LatencyMaximum,
     long ProbeSuccesses, long ProbeFailures, string State);
+/// <summary>Optional age and database-size limits; null disables the corresponding limit.</summary>
 public sealed record StoragePolicy(int? RetentionDays = 30, long? MaximumBytes = 1_073_741_824);
 
+/// <summary>
+/// Owns the Service's SQLite history database. Collection and maintenance are
+/// best-effort: a storage failure must not interrupt packet routing.
+/// </summary>
 public sealed class TelemetryHistoryStore : IAsyncDisposable
 {
     private readonly string _path;
@@ -14,6 +20,7 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
     private readonly WanHealthService _health;
     private readonly RedirectorService _redirector;
     private readonly CancellationTokenSource _cts = new();
+    // Serializes writes, queries and maintenance on the shared history state.
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly Dictionary<string, (long Rx, long Tx, long Success, long Failure, string State)> _last = new(StringComparer.OrdinalIgnoreCase);
     private (long Failover, long Failback, long Strict) _lastRouting;
@@ -38,6 +45,8 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
     private async Task InitializeAsync()
     {
         await using var db = new SqliteConnection(ConnectionString); await db.OpenAsync();
+        // WAL permits readers while the sampling worker writes; NORMAL sync keeps
+        // historical data less costly than the routing path it observes.
         await Command(db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; " +
             "CREATE TABLE IF NOT EXISTS raw_samples(ts INTEGER NOT NULL,wan TEXT NOT NULL,rx_rate REAL NOT NULL,tx_rate REAL NOT NULL,rx_delta INTEGER NOT NULL,tx_delta INTEGER NOT NULL,latency REAL NULL,probe_ok INTEGER NOT NULL,probe_fail INTEGER NOT NULL,state TEXT NOT NULL);" +
             "CREATE INDEX IF NOT EXISTS ix_raw_wan_ts ON raw_samples(wan,ts);" +
@@ -50,6 +59,8 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
 
     private async Task RunAsync(CancellationToken ct)
     {
+        // Record raw samples every five seconds and run retention maintenance daily.
+        // A failed sample is logged locally and leaves the routing engine running.
         using var sample = new PeriodicTimer(TimeSpan.FromSeconds(5));
         DateTime nextMaintenance = DateTime.UtcNow.AddDays(1);
         try
@@ -65,6 +76,8 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
 
     private async Task WriteSampleAsync()
     {
+        // Store deltas from cumulative health counters, then turn routing counter
+        // increases into discrete events so history reflects each occurrence.
         await _gate.WaitAsync();
         try
         {
@@ -99,6 +112,8 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
 
     public async Task<IReadOnlyList<HistoryPoint>> QueryAsync(string wan, DateTimeOffset from, DateTimeOffset to, string resolution)
     {
+        // Query raw and previously compacted buckets together; time resolution is
+        // selected for the requested range and the response is bounded for the UI.
         int bucket = resolution.ToLowerInvariant() switch { "5s" => 5, "1m" => 60, "5m" => 300, "15m" => 900, "auto" => (to-from).TotalHours <= 24 ? 60 : (to-from).TotalDays <= 7 ? 300 : 900, _ => throw new InvalidDataException("Invalid resolution.") };
         await _gate.WaitAsync();
         try
@@ -133,6 +148,9 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
 
     public async Task MaintainAsync()
     {
+        // Keep recent 5-second samples; compact older data to 1-, 5-, then
+        // 15-minute buckets. Age retention applies to samples, buckets and events.
+        // Size pruning prefers oldest aggregates and avoids recent raw samples.
         await _gate.WaitAsync();
         try
         {
@@ -145,6 +163,7 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
         finally{_gate.Release();}
     }
 
+    // Insert the aggregate and remove its source rows in one transaction.
     private async Task Aggregate(SqliteConnection db,int resolution,long cutoff){await using var tx=await db.BeginTransactionAsync();await using var cmd=db.CreateCommand();cmd.Transaction=(SqliteTransaction)tx;cmd.CommandText="INSERT OR REPLACE INTO aggregates SELECT (ts/$r)*$r,wan,$r,AVG(rx_rate),MAX(rx_rate),AVG(tx_rate),MAX(tx_rate),MIN(latency),AVG(latency),MAX(latency),SUM(probe_ok),SUM(probe_fail),MAX(state) FROM raw_samples WHERE ts<$c GROUP BY wan,(ts/$r)";cmd.Parameters.AddWithValue("$r",resolution);cmd.Parameters.AddWithValue("$c",cutoff);await cmd.ExecuteNonQueryAsync();cmd.CommandText="DELETE FROM raw_samples WHERE ts<$c";await cmd.ExecuteNonQueryAsync();await tx.CommitAsync();}
     private static async Task Reaggregate(SqliteConnection db,int source,int target,long cutoff){await using var tx=await db.BeginTransactionAsync();await using var cmd=db.CreateCommand();cmd.Transaction=(SqliteTransaction)tx;cmd.CommandText="INSERT OR REPLACE INTO aggregates SELECT (ts/$t)*$t,wan,$t,AVG(rx_avg),MAX(rx_max),AVG(tx_avg),MAX(tx_max),MIN(lat_min),AVG(lat_avg),MAX(lat_max),SUM(probe_ok),SUM(probe_fail),MAX(state) FROM aggregates WHERE resolution=$s AND ts<$c GROUP BY wan,(ts/$t)";cmd.Parameters.AddWithValue("$s",source);cmd.Parameters.AddWithValue("$t",target);cmd.Parameters.AddWithValue("$c",cutoff);await cmd.ExecuteNonQueryAsync();cmd.CommandText="DELETE FROM aggregates WHERE resolution=$s AND ts<$c";await cmd.ExecuteNonQueryAsync();await tx.CommitAsync();}
     private long DatabaseSize()=> (File.Exists(_path)?new FileInfo(_path).Length:0)+(File.Exists(_path+"-wal")?new FileInfo(_path+"-wal").Length:0);
@@ -157,6 +176,7 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
     private static async Task<long?> ReadNullableLong(SqliteConnection db,string key,long fallback){string? v=await Read(db,key);return v is null?fallback:v=="unlimited"?null:long.Parse(v);}
     private static async Task<string?> Read(SqliteConnection db,string key){await using var c=db.CreateCommand();c.CommandText="SELECT value FROM settings WHERE key=$k";c.Parameters.AddWithValue("$k",key);return await c.ExecuteScalarAsync() as string;}
     private static async Task InsertEvent(SqliteConnection db,long ts,string type,string? wan,string? detail){await using var c=db.CreateCommand();c.CommandText="INSERT INTO events VALUES($t,$type,$wan,$detail)";c.Parameters.AddWithValue("$t",ts);c.Parameters.AddWithValue("$type",type);c.Parameters.AddWithValue("$wan",(object?)wan??DBNull.Value);c.Parameters.AddWithValue("$detail",(object?)detail??DBNull.Value);await c.ExecuteNonQueryAsync();}
+    // Event persistence is deliberately isolated from its Service caller.
     public async Task AddEventAsync(string type,string? wan,string? detail){try{await _gate.WaitAsync();try{await using var db=new SqliteConnection(ConnectionString);await db.OpenAsync();await InsertEvent(db,DateTimeOffset.UtcNow.ToUnixTimeSeconds(),type,wan,detail);}finally{_gate.Release();}}catch(Exception ex){Console.WriteLine($"TELEMETRY EVENT ERROR: {ex.Message}");}}
     public async ValueTask DisposeAsync(){_cts.Cancel();try{if(_worker is not null)await _worker;}catch(OperationCanceledException){}await AddEventAsync("SERVICE_STOP",null,null);_cts.Dispose();_gate.Dispose();}
 }
