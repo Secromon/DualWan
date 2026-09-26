@@ -14,7 +14,7 @@ namespace NetBinder.Service.Services;
 
 public sealed record ControlRule(string Process, string Wan, string Mode, bool Enabled);
 public sealed record ControlGroup(string Name, string Wan, string Mode, bool Enabled,
-    IReadOnlyList<string> Applications);
+    IReadOnlyList<string> Applications, string? OriginalName = null);
 /// <summary>Stable adapter identity and a display-only label requested by the Dashboard.</summary>
 public sealed record ControlWanSelection(string InterfaceId, string FriendlyName);
 public sealed record ControlResult(bool Success, object? Data = null, string? ErrorCode = null, string? ErrorMessage = null)
@@ -254,7 +254,8 @@ public sealed class ControlPipeServer : IAsyncDisposable
         if (!root.TryGetProperty("group", out var element) || element.ValueKind != JsonValueKind.Object)
             return ControlResult.Error("INVALID_GROUP", "group object is required.");
         bool enabled = true;
-        if (element.TryGetProperty("enabled", out var enabledElement))
+        bool enabledProvided = element.TryGetProperty("enabled", out var enabledElement);
+        if (enabledProvided)
         {
             if (enabledElement.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
                 return ControlResult.Error("INVALID_GROUP", "enabled must be a boolean.");
@@ -269,8 +270,17 @@ public sealed class ControlPipeServer : IAsyncDisposable
                 return ControlResult.Error("INVALID_GROUP", "applications must contain process names.");
             applications.Add(app.GetString()!);
         }
+        string? originalName = null;
+        if (element.TryGetProperty("originalName", out var original))
+        {
+            if (original.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(original.GetString()))
+                return ControlResult.Error("INVALID_GROUP", "originalName must be a non-empty string.");
+            originalName = original.GetString()!.Trim();
+        }
+        if (originalName is not null && !enabledProvided)
+            return ControlResult.Error("INVALID_GROUP", "enabled is required when editing a group.");
         var group = new ControlGroup(RequiredString(element, "name"), RequiredString(element, "wan"),
-            RequiredString(element, "mode"), enabled, applications);
+            RequiredString(element, "mode"), enabled, applications, originalName);
         return await _controlPlane.UpsertGroupAsync(group, cancellationToken);
     }
 
