@@ -663,6 +663,66 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
         catch (Exception ex) { Console.WriteLine($"TELEMETRY STATUS ERROR: {ex.Message}"); return ControlResult.Error("HISTORY_UNAVAILABLE", "Storage status unavailable."); }
     }
 
+    public async Task<ControlResult> GetAppStatisticsSummaryAsync(string period, int limit)
+    {
+        if (!ApplicationTrafficPersistence.IsSupportedPeriod(period))
+            return ControlResult.Error("INVALID_PERIOD", "Supported periods: 1h, 24h, 7d, 30d.");
+        if (limit is < 1 or > 100)
+            return ControlResult.Error("INVALID_LIMIT", "limit must be from 1 to 100.");
+        if (_history?.AppStatsRetentionMinutes is null)
+            return ControlResult.Error("APP_STATS_UNAVAILABLE", "Application statistics are unavailable.");
+        try { return ControlResult.Ok(await _history.QueryAppSummaryAsync(period, limit)); }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"APP STATS QUERY ERROR: {ex.GetType().Name}; routing continues");
+            return ControlResult.Error("APP_STATS_UNAVAILABLE", "Application statistics query failed.");
+        }
+    }
+
+    public async Task<ControlResult> GetAppStatisticsDetailAsync(string appKey, string period)
+    {
+        if (!ApplicationTrafficPersistence.IsSupportedPeriod(period))
+            return ControlResult.Error("INVALID_PERIOD", "Supported periods: 1h, 24h, 7d, 30d.");
+        if (string.IsNullOrWhiteSpace(appKey) || appKey.Length > 32767)
+            return ControlResult.Error("INVALID_APP_KEY", "appKey is required and must be bounded.");
+        if (_history?.AppStatsRetentionMinutes is null)
+            return ControlResult.Error("APP_STATS_UNAVAILABLE", "Application statistics are unavailable.");
+        try { return ControlResult.Ok(await _history.QueryAppDetailAsync(appKey, period)); }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"APP STATS QUERY ERROR: {ex.GetType().Name}; routing continues");
+            return ControlResult.Error("APP_STATS_UNAVAILABLE", "Application statistics query failed.");
+        }
+    }
+
+    public Task<ControlResult> GetAppStatsRetentionAsync()
+    {
+        int? minutes = _history?.AppStatsRetentionMinutes;
+        return Task.FromResult(minutes is null
+            ? ControlResult.Error("APP_STATS_UNAVAILABLE", "Application statistics are unavailable.")
+            : ControlResult.Ok(new { retentionMinutes = minutes.Value,
+                allowedValues = new[] { 60, 1440, 10080, 43200 } }));
+    }
+
+    public async Task<ControlResult> SetAppStatsRetentionAsync(int minutes)
+    {
+        if (!ApplicationTrafficPersistence.IsSupportedRetention(minutes))
+            return ControlResult.Error("INVALID_RETENTION", "Supported retention minutes: 60, 1440, 10080, 43200.");
+        if (_history?.AppStatsRetentionMinutes is null)
+            return ControlResult.Error("APP_STATS_UNAVAILABLE", "Application statistics are unavailable.");
+        try
+        {
+            await _history.SetAppStatsRetentionAsync(minutes);
+            return ControlResult.Ok(new { retentionMinutes = minutes,
+                allowedValues = new[] { 60, 1440, 10080, 43200 } });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"APP STATS RETENTION ERROR: {ex.GetType().Name}; routing continues");
+            return ControlResult.Error("APP_STATS_UNAVAILABLE", "Application statistics retention update failed.");
+        }
+    }
+
     public async Task<ControlResult> SetTelemetryStoragePolicyAsync(int? retentionDays, long? maximumBytes)
     {
         if (_history is null) return ControlResult.Error("HISTORY_UNAVAILABLE", "Historical telemetry is unavailable.");

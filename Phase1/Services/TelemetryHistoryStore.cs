@@ -185,6 +185,21 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
         finally{_gate.Release();}
     }
 
+    public Task<AppTrafficSummary> QueryAppSummaryAsync(string period, int limit) =>
+        _appTraffic?.QuerySummaryAsync(period, limit) ??
+        Task.FromException<AppTrafficSummary>(new InvalidOperationException("Application statistics unavailable."));
+
+    public Task<AppTrafficDetail> QueryAppDetailAsync(string appKey, string period) =>
+        _appTraffic?.QueryDetailAsync(appKey, period) ??
+        Task.FromException<AppTrafficDetail>(new InvalidOperationException("Application statistics unavailable."));
+
+    public int? AppStatsRetentionMinutes => _appTraffic?.Enabled == true ? _appTraffic.RetentionMinutes : null;
+
+    public Task SetAppStatsRetentionAsync(int minutes) =>
+        _appTraffic?.Enabled == true
+            ? _appTraffic.SetRetentionAsync(minutes)
+            : Task.FromException(new InvalidOperationException("Application statistics unavailable."));
+
     /// <summary>Call after relay producers have stopped; bounded best-effort final flush.</summary>
     public async Task FlushFinalAppTrafficAsync()
     {

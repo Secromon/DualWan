@@ -3,7 +3,7 @@ using Microsoft.Data.Sqlite;
 namespace NetBinder.Service.Services;
 
 /// <summary>Best-effort, bounded persistence of completed DualWAN relay minutes.</summary>
-public sealed class ApplicationTrafficPersistence
+public sealed partial class ApplicationTrafficPersistence
 {
     private const int MaxPendingMinutes = 4;
     private const int MaxDeleteBatches = 20;
