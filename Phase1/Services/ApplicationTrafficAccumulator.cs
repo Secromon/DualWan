@@ -52,14 +52,21 @@ public sealed class ApplicationTrafficAccumulator
     private readonly object _rotation = new();
     private readonly LinkedList<Bucket> _buckets = new();
     private Bucket? _current;
+    private long _lastSealedMinute = long.MinValue;
     private long _missedAttribution;
     private long _failedUpdates;
+    private long _droppedBuckets;
 
     public ApplicationTrafficAccumulator(Func<DateTimeOffset>? clock = null) =>
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
 
     public long MissedAttribution => Interlocked.Read(ref _missedAttribution);
     public long FailedUpdates => Interlocked.Read(ref _failedUpdates);
+    public long DroppedBuckets => Interlocked.Read(ref _droppedBuckets);
+    public int PendingSealedBuckets
+    {
+        get { lock (_rotation) return _buckets.Count(x => Volatile.Read(ref x.Sealed) != 0); }
+    }
 
     public FlowCounter? CreateFlow(string? executablePath, string? actualWan)
     {
@@ -122,7 +129,12 @@ public sealed class ApplicationTrafficAccumulator
                 bucket = _current;
                 if (bucket is null || minute > bucket.Minute)
                 {
-                    if (bucket is not null) Volatile.Write(ref bucket.Sealed, 1);
+                    if (bucket is not null)
+                    {
+                        Volatile.Write(ref bucket.Sealed, 1);
+                        _lastSealedMinute = Math.Max(_lastSealedMinute, bucket.Minute);
+                    }
+                    minute = Math.Max(minute, _lastSealedMinute + 60);
                     bucket = new Bucket(minute);
                     _buckets.AddLast(bucket);
                     Volatile.Write(ref _current, bucket);
@@ -142,7 +154,44 @@ public sealed class ApplicationTrafficAccumulator
     {
         while (_buckets.Count > RetainedMinutes && _buckets.First is { } first &&
                Volatile.Read(ref first.Value.Writers) == 0)
+        {
+            if (!first.Value.Cells.IsEmpty) Interlocked.Increment(ref _droppedBuckets);
             _buckets.RemoveFirst();
+        }
+    }
+
+    /// <summary>Returns immutable completed minutes and releases them from RAM.
+    /// Call with sealCurrent only after relay producers have stopped.</summary>
+    public IReadOnlyList<IReadOnlyList<Snapshot>> CollectSealed(DateTimeOffset now, bool sealCurrent = false)
+    {
+        lock (_rotation)
+        {
+            long minute = now.ToUniversalTime().ToUnixTimeSeconds() / 60 * 60;
+            if (_current is { } current && (sealCurrent || current.Minute < minute))
+            {
+                Volatile.Write(ref current.Sealed, 1);
+                _lastSealedMinute = Math.Max(_lastSealedMinute, current.Minute);
+                Volatile.Write(ref _current, null);
+            }
+            var result = new List<IReadOnlyList<Snapshot>>();
+            for (var node = _buckets.First; node is not null;)
+            {
+                var next = node.Next;
+                Bucket bucket = node.Value;
+                if (Volatile.Read(ref bucket.Sealed) != 0 &&
+                    Volatile.Read(ref bucket.Writers) == 0)
+                {
+                    var rows = bucket.Cells.Select(pair => new Snapshot(
+                        bucket.Minute, pair.Key.Path, pair.Key.Wan,
+                        Interlocked.Read(ref pair.Value.Upload), Interlocked.Read(ref pair.Value.Download),
+                        Interlocked.Read(ref pair.Value.Tcp), Interlocked.Read(ref pair.Value.Udp))).ToArray();
+                    if (rows.Length != 0) result.Add(rows);
+                    _buckets.Remove(node);
+                }
+                node = next;
+            }
+            return result;
+        }
     }
 
     /// <summary>Copies counters for tests and future persistence; never exposes cells.</summary>

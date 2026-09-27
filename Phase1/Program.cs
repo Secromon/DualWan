@@ -177,7 +177,8 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
             _engineReady = true;
             try
             {
-                _history = new TelemetryHistoryStore(_options.Paths.TelemetryDatabase, _wanMap, _health, _redirector);
+                _history = new TelemetryHistoryStore(_options.Paths.TelemetryDatabase, _wanMap,
+                    _health, _redirector, _applicationTraffic);
                 await _history.StartAsync();
                 Console.WriteLine($"Historical telemetry started: {_options.Paths.TelemetryDatabase}");
             }
@@ -286,13 +287,18 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
         _engineReady = false;
         // The Service and pipe may outlive the engine. Dispose consumers before their
         // WAN health and relay dependencies, then clear the process ownership marker.
-        if (_history is not null) { await _history.DisposeAsync(); _history = null; }
         _redirector?.Stop();
         _redirector = null;
         _relay?.Stop();
         _relay = null;
         _udpRelay?.Dispose();
         _udpRelay = null;
+        if (_history is not null)
+        {
+            await _history.FlushFinalAppTrafficAsync();
+            await _history.DisposeAsync();
+            _history = null;
+        }
         _applicationTraffic = null;
         _health?.Dispose();
         _health = null;
@@ -603,7 +609,8 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
             try
             {
                 await _history.DisposeAsync();
-                _history = new TelemetryHistoryStore(_options.Paths.TelemetryDatabase, resolved, replacement, _redirector);
+                _history = new TelemetryHistoryStore(_options.Paths.TelemetryDatabase, resolved,
+                    replacement, _redirector, _applicationTraffic);
                 await _history.StartAsync();
             }
             catch (Exception ex)
