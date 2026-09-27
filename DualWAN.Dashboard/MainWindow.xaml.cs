@@ -165,8 +165,17 @@ public partial class MainWindow : Window
             ?? throw new IOException("The service closed the control pipe.");
         using var document = JsonDocument.Parse(response);
         if (!document.RootElement.GetProperty("success").GetBoolean())
-            throw new InvalidDataException("The service rejected the request.");
+        {
+            string code = document.RootElement.TryGetProperty("error", out var error) &&
+                error.TryGetProperty("code", out var value) ? value.GetString() ?? "" : "";
+            throw new ServiceRequestException(code);
+        }
         return document.RootElement.GetProperty("data").Clone();
+    }
+
+    private sealed class ServiceRequestException(string code) : IOException(code)
+    {
+        public string Code { get; } = code;
     }
 
     private void Render(JsonElement data)
@@ -241,6 +250,7 @@ public partial class MainWindow : Window
         if (MainTabs.SelectedIndex == 5) { await LoadStorageStatusAsync(); await LoadWanSettingsAsync(); }
         if (MainTabs.SelectedIndex == 6) { await RefreshRulesAsync(); await RefreshGroupsAsync(); }
         if (MainTabs.SelectedIndex == 7) RefreshHelp();
+        if (MainTabs.SelectedIndex == 8) await LoadStatisticsAsync();
     }
 
     // -----------------------------------------------------------------------------
@@ -495,7 +505,8 @@ public partial class MainWindow : Window
     // -----------------------------------------------------------------------------
     // Mutating IPC: an elevated Dashboard helper performs writes
     // -----------------------------------------------------------------------------
-    private async Task<bool> RunWriteAsync(object request, bool wanConfiguration = false, bool groupWrite = false)
+    private async Task<bool> RunWriteAsync(object request, bool wanConfiguration = false, bool groupWrite = false,
+        bool appStatsRetention = false)
     {
         // The normal Dashboard process stays unelevated. UAC launches a short-lived
         // helper, and the Service still verifies the pipe client's administrator token.
@@ -523,9 +534,9 @@ public partial class MainWindow : Window
             string message = process.ExitCode switch
             {
                 2 => _loc.Text("error.serviceOffline"),
-                3 => _loc.Text(groupWrite ? "groups.error.invalid" : wanConfiguration ? "settings.wan.error" : "error.invalidRule"),
+                3 => _loc.Text(groupWrite ? "groups.error.invalid" : wanConfiguration ? "settings.wan.error" : appStatsRetention ? "stats.retentionError" : "error.invalidRule"),
                 4 => _loc.Text("error.permissionDenied"),
-                5 => _loc.Text(wanConfiguration ? "settings.wan.error" : "error.saveFailed"),
+                5 => _loc.Text(wanConfiguration ? "settings.wan.error" : appStatsRetention ? "stats.retentionError" : "error.saveFailed"),
                 >= 20 and <= 25 when groupWrite => _loc.Text(GroupErrorKey(process.ExitCode)),
                 _ => _loc.Text("common.error")
             };
@@ -534,7 +545,8 @@ public partial class MainWindow : Window
         }
         catch (Win32Exception ex) when (ex.NativeErrorCode == 1223)
         {
-            RulesStatus.Text = _loc.Text("common.uacCancelled");
+            if (appStatsRetention) StatsStatus.Text = _loc.Text("common.uacCancelled");
+            else RulesStatus.Text = _loc.Text("common.uacCancelled");
             return false;
         }
         catch (Exception ex)
@@ -725,12 +737,12 @@ public partial class MainWindow : Window
     {
         bool compact=e.NewSize.Width<1020;SidebarColumn.Width=new GridLength(compact?68:220);
         Visibility visibility=compact?Visibility.Collapsed:Visibility.Visible;
-        BrandText.Visibility=VersionText.Visibility=NavDashboardText.Visibility=NavApplicationsText.Visibility=NavHistoryText.Visibility=NavGroupsText.Visibility=NavPresetsText.Visibility=NavSettingsText.Visibility=NavHelpText.Visibility=visibility;
+        BrandText.Visibility=VersionText.Visibility=NavDashboardText.Visibility=NavApplicationsText.Visibility=NavHistoryText.Visibility=NavStatisticsText.Visibility=NavGroupsText.Visibility=NavPresetsText.Visibility=NavSettingsText.Visibility=NavHelpText.Visibility=visibility;
     }
     private void UpdateNavigation()
     {
-        RadioButton selected=MainTabs.SelectedIndex switch{2=>NavGroups,3=>NavPresets,4=>NavHistory,5=>NavSettings,6=>NavApplications,7=>NavHelp,_=>NavDashboard};selected.IsChecked=true;
-        HeaderTitle.Text=MainTabs.SelectedIndex switch{2=>_loc.Text("tab.groups"),3=>_loc.Text("tab.presets"),4=>_loc.Text("tab.history"),5=>_loc.Text("tab.settings"),6=>_loc.Text("tab.applications"),7=>_loc.Text("tab.help"),_=>_loc.Text("tab.dashboard")};
+        RadioButton selected=MainTabs.SelectedIndex switch{2=>NavGroups,3=>NavPresets,4=>NavHistory,5=>NavSettings,6=>NavApplications,7=>NavHelp,8=>NavStatistics,_=>NavDashboard};selected.IsChecked=true;
+        HeaderTitle.Text=MainTabs.SelectedIndex switch{2=>_loc.Text("tab.groups"),3=>_loc.Text("tab.presets"),4=>_loc.Text("tab.history"),5=>_loc.Text("tab.settings"),6=>_loc.Text("tab.applications"),7=>_loc.Text("tab.help"),8=>_loc.Text("tab.statistics"),_=>_loc.Text("tab.dashboard")};
     }
     private void ApplyTheme()
     {
@@ -756,6 +768,7 @@ public partial class MainWindow : Window
                 Source = new Uri($"/DualWAN.Dashboard;component/Themes/{selected}.xaml", UriKind.Relative)
             };
         RedrawHistoryPanels();
+        RedrawStatisticsChart();
     }
     private static bool IsWindowsDarkTheme()
     {
@@ -763,11 +776,12 @@ public partial class MainWindow : Window
     }
     private void ApplyLanguage()
     {
-        DashboardTab.Header=_loc.Text("tab.dashboard");RulesTab.Header=_loc.Text("tab.rules");GroupsTab.Header=_loc.Text("tab.groups");PresetsTab.Header=_loc.Text("tab.presets");HistoryTab.Header=_loc.Text("tab.history");SettingsTab.Header=_loc.Text("tab.settings");ApplicationsTab.Header=_loc.Text("tab.applications");HelpTab.Header=_loc.Text("tab.help");
+        DashboardTab.Header=_loc.Text("tab.dashboard");RulesTab.Header=_loc.Text("tab.rules");GroupsTab.Header=_loc.Text("tab.groups");PresetsTab.Header=_loc.Text("tab.presets");HistoryTab.Header=_loc.Text("tab.history");SettingsTab.Header=_loc.Text("tab.settings");ApplicationsTab.Header=_loc.Text("tab.applications");HelpTab.Header=_loc.Text("tab.help");StatisticsTab.Header=_loc.Text("tab.statistics");
         HistoryTitle.Text=_loc.Text("history.title");HistoryRangeLabel.Text=_loc.Text("history.range");HistoryRefreshButton.Content=_loc.Text("history.refresh");HistoryWan1TrafficTitle.Text=HistoryWan2TrafficTitle.Text=_loc.Text("history.traffic");HistoryWan1QualityTitle.Text=HistoryWan2QualityTitle.Text=_loc.Text("history.quality");HistoryWan1Empty.Text=HistoryWan2Empty.Text=_loc.Text("history.emptyWan");RedrawHistoryPanels();
         SettingsTitle.Text=_loc.Text("settings.title");HistoricalSettingsTitle.Text=_loc.Text("settings.historical");RetentionLabel.Text=_loc.Text("settings.retention");CustomRetentionLabel.Text=_loc.Text("settings.customDays");MaximumSizeLabel.Text=_loc.Text("settings.maximumSize");LanguageLabel.Text=_loc.Text("settings.language");SaveSettingsButton.Content=_loc.Text("settings.save");CleanHistoryButton.Content=_loc.Text("settings.clean");
         WanConfigurationTitle.Text=_loc.Text("settings.wan.title");WanConfigurationDescription.Text=_loc.Text("settings.wan.description");Wan1InterfaceLabel.Text=Wan2InterfaceLabel.Text=_loc.Text("settings.wan.interface");Wan1FriendlyLabel.Text=Wan2FriendlyLabel.Text=_loc.Text("settings.wan.friendly");SaveWanConfigurationButton.Content=_loc.Text("settings.wan.save");
-        NavDashboardText.Text=_loc.Text("tab.dashboard");NavApplicationsText.Text=_loc.Text("tab.applications");NavHistoryText.Text=_loc.Text("tab.history");NavGroupsText.Text=_loc.Text("tab.groups");NavPresetsText.Text=_loc.Text("tab.presets");NavSettingsText.Text=_loc.Text("tab.settings");NavHelpText.Text=_loc.Text("tab.help");RefreshHelp();
+        NavDashboardText.Text=_loc.Text("tab.dashboard");NavApplicationsText.Text=_loc.Text("tab.applications");NavHistoryText.Text=_loc.Text("tab.history");NavStatisticsText.Text=_loc.Text("tab.statistics");NavGroupsText.Text=_loc.Text("tab.groups");NavPresetsText.Text=_loc.Text("tab.presets");NavSettingsText.Text=_loc.Text("tab.settings");NavHelpText.Text=_loc.Text("tab.help");RefreshHelp();
+        ApplyStatisticsLanguage();
         ApplicationsTitle.Text=_loc.Text("tab.applications");ApplicationsSubtitle.Text=_loc.Text("apps.subtitle");AddApplicationButton.Content=_loc.Text("apps.add");ApplicationsStatus.Text=_loc.Text("apps.configured");ApplicationsEmpty.Text=_loc.Text("apps.empty");ApplicationsSearchHint.Text=_loc.Text("apps.search");ApplicationsSearchEmpty.Text=_loc.Text("apps.searchEmpty");Application.Current.Resources["apps.edit"]=_loc.Text("common.edit");Application.Current.Resources["apps.remove"]=_loc.Text("apps.remove");Application.Current.Resources["apps.openFileLocation"]=_loc.Text("apps.openFileLocation");RefreshApplications();
         DashboardTitle.Text=_loc.Text("dashboard.title");DashboardSubtitle.Text=_loc.Text("dashboard.subtitle");Wan1RxLabel.Text=Wan2RxLabel.Text=_loc.Text("dashboard.download");Wan1TxLabel.Text=Wan2TxLabel.Text=_loc.Text("dashboard.upload");Wan1PingLabel.Text=Wan2PingLabel.Text=_loc.Text("dashboard.ping");Wan1LossLabel.Text=Wan2LossLabel.Text=_loc.Text("dashboard.loss");Wan1UptimeLabel.Text=Wan2UptimeLabel.Text=_loc.Text("dashboard.uptime");Wan1TotalsLabel.Text=Wan2TotalsLabel.Text=_loc.Text("dashboard.totals");
         RulesTitle.Text=_loc.Text("rules.title");RulesSubtitle.Text=_loc.Text("rules.subtitle");RefreshRulesButton.Content=_loc.Text("common.refresh");AddRuleButton.Content=_loc.Text("rules.add");RulesHelp.Text=_loc.Text("rules.help");RuleApplicationColumn.Header=_loc.Text("rules.application");RuleModeColumn.Header=_loc.Text("common.mode");RuleStatusColumn.Header=_loc.Text("common.status");RuleActionsColumn.Header=_loc.Text("common.actions");

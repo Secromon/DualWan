@@ -98,7 +98,7 @@ public partial class App : Application
             string request = Encoding.UTF8.GetString(Convert.FromBase64String(encodedRequest));
             using var requestDocument = JsonDocument.Parse(request);
             string command = requestDocument.RootElement.GetProperty("command").GetString() ?? "";
-            if (command is not ("upsertRule" or "deleteRule" or "upsertGroup" or "deleteGroup" or "applyPreset" or "setTelemetryStoragePolicy" or "cleanTelemetry" or "setWanConfiguration")) return 3;
+            if (command is not ("upsertRule" or "deleteRule" or "upsertGroup" or "deleteGroup" or "applyPreset" or "setTelemetryStoragePolicy" or "cleanTelemetry" or "setWanConfiguration" or "setAppStatsRetention")) return 3;
 
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             using var pipe = new NamedPipeClientStream(".", "DualWAN.Control", PipeDirection.InOut,
