@@ -84,6 +84,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
     private UdpRelay? _udpRelay;
     private RedirectorService? _redirector;
     private TransparentProxy? _relay;
+    private ApplicationTrafficAccumulator? _applicationTraffic;
     private ControlPipeServer? _ipc;
     private TelemetryHistoryStore? _history;
     private Dictionary<string, BindingMapping> _wanMap = new(StringComparer.OrdinalIgnoreCase);
@@ -161,10 +162,11 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
                 _options.Debug);
             await _health.StartAsync();
             Console.WriteLine("Health service started");
-            _udpRelay = new UdpRelay();
+            _applicationTraffic = new ApplicationTrafficAccumulator();
+            _udpRelay = new UdpRelay(_applicationTraffic);
             Console.WriteLine("UDP relay started");
             _redirector = new RedirectorService(_udpRelay, OnRedirectorFailure);
-            _relay = new TransparentProxy(_redirector.GetNATMapping);
+            _relay = new TransparentProxy(_redirector.GetNATMapping, _applicationTraffic);
             if (!_relay.Start()) throw new InvalidOperationException("TCP relay failed to start.");
             Console.WriteLine($"TCP relay started on 127.0.0.1:{_relay.ListenPort}");
             _redirector.UpdateBindings(wanMap.Values, policies, _health);
@@ -291,6 +293,7 @@ sealed class DualWanRuntime : IHostedService, IDualWanControlPlane
         _relay = null;
         _udpRelay?.Dispose();
         _udpRelay = null;
+        _applicationTraffic = null;
         _health?.Dispose();
         _health = null;
         _engineReady = false;

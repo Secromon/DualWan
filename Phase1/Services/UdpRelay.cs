@@ -21,6 +21,7 @@ public sealed class UdpRelay : IDisposable
         private int _sendLogged;
         private int _successLogged;
         private int _closed;
+        private readonly ApplicationTrafficAccumulator.FlowCounter? _traffic;
 
         public long Id { get; }
         public int Pid { get; }
@@ -39,13 +40,15 @@ public sealed class UdpRelay : IDisposable
         public string State { get; private set; } = "CREATED";
 
         internal Session(long id, int pid, string executable, BindingMapping binding,
-            IPEndPoint source, IPEndPoint destination, uint ifIdx, uint subIfIdx)
+            IPEndPoint source, IPEndPoint destination, uint ifIdx, uint subIfIdx,
+            ApplicationTrafficAccumulator? traffic)
         {
             Id = id;
             Pid = pid;
             Executable = executable;
             ProcessName = Path.GetFileName(executable);
             Binding = binding;
+            _traffic = traffic?.CreateFlow(executable, binding.LogicalWan);
             OriginalSource = source;
             Destination = destination;
             OriginalIfIdx = ifIdx;
@@ -78,10 +81,19 @@ public sealed class UdpRelay : IDisposable
             if (State == "CREATED") State = "ACTIVE";
         }
 
+        private void CountOutbound(int bytes)
+        {
+            _traffic?.UdpSent(bytes);
+        }
+
         private async Task ForwardLoopAsync(CancellationToken ct)
         {
             var buffer = new byte[65535];
             EndPoint sender = new IPEndPoint(IPAddress.Any, 0);
+            ValueTask<int> Send(ReadOnlyMemory<byte> data, CancellationToken token) =>
+                _outbound.SendAsync(data, SocketFlags.None, token);
+            Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<int>> send = Send;
+            Action<int> count = CountOutbound;
             try
             {
                 while (!ct.IsCancellationRequested)
@@ -94,7 +106,7 @@ public sealed class UdpRelay : IDisposable
                         continue;
                     }
                     Touch();
-                    await _outbound.SendAsync(buffer.AsMemory(0, result.ReceivedBytes), SocketFlags.None, ct);
+                    await SendDatagramAsync(buffer.AsMemory(0, result.ReceivedBytes), send, count, ct);
                     if (Interlocked.Exchange(ref _sendLogged, 1) == 0)
                         Console.WriteLine($"DEBUG UDP FLOW {Id}: IP_UNICAST_IF={Binding.InterfaceIndex} SUCCESS; bind={OutboundAddress}:{OutboundPort} SUCCESS; send SUCCESS");
                 }
@@ -107,14 +119,18 @@ public sealed class UdpRelay : IDisposable
         private async Task ReplyLoopAsync(CancellationToken ct)
         {
             var buffer = new byte[65535];
+            ValueTask<int> Send(ReadOnlyMemory<byte> data, CancellationToken token) =>
+                _loopback.SendToAsync(data, SocketFlags.None,
+                    new IPEndPoint(IPAddress.Loopback, OriginalSource.Port), token);
+            Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<int>> send = Send;
+            Action<int>? count = _traffic is null ? null : _traffic.Download;
             try
             {
                 while (!ct.IsCancellationRequested)
                 {
                     int received = await _outbound.ReceiveAsync(buffer, SocketFlags.None, ct);
                     Touch();
-                    await _loopback.SendToAsync(buffer.AsMemory(0, received), SocketFlags.None,
-                        new IPEndPoint(IPAddress.Loopback, OriginalSource.Port), ct);
+                    await SendDatagramAsync(buffer.AsMemory(0, received), send, count, ct);
                     if (Interlocked.Exchange(ref _successLogged, 1) == 0)
                     {
                         State = "ACTIVE";
@@ -156,6 +172,21 @@ public sealed class UdpRelay : IDisposable
 
     private readonly ConcurrentDictionary<ushort, Session> _byRelayPort = new();
     private readonly ConcurrentDictionary<(IPAddress, ushort), Session> _byOutbound = new();
+    private readonly ApplicationTrafficAccumulator? _traffic;
+
+    public UdpRelay(ApplicationTrafficAccumulator? traffic = null) => _traffic = traffic;
+
+    /// <summary>A UDP payload counts only after the whole datagram send succeeds.</summary>
+    public static async ValueTask SendDatagramAsync(ReadOnlyMemory<byte> data,
+        Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<int>> send,
+        Action<int>? counted, CancellationToken ct = default)
+    {
+        int sent = await send(data, ct);
+        if (sent != data.Length)
+            throw new IOException("UDP relay datagram was not fully accepted.");
+        try { counted?.Invoke(sent); }
+        catch { /* Statistics must never affect relay delivery. */ }
+    }
 
     public Session? Create(long id, int pid, string executable, BindingMapping binding,
         IPEndPoint source, IPEndPoint destination, uint ifIdx, uint subIfIdx)
@@ -163,7 +194,7 @@ public sealed class UdpRelay : IDisposable
         Session? session = null;
         try
         {
-            session = new Session(id, pid, executable, binding, source, destination, ifIdx, subIfIdx);
+            session = new Session(id, pid, executable, binding, source, destination, ifIdx, subIfIdx, _traffic);
             if (!_byRelayPort.TryAdd(session.RelayPort, session) ||
                 !_byOutbound.TryAdd((session.OutboundAddress, session.OutboundPort), session))
             {
