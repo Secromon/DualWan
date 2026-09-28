@@ -49,7 +49,9 @@ Directory.CreateDirectory(folder);
 try
 {
     string path = Path.Combine(folder, "telemetry.db");
-    DateTimeOffset now = new(2026, 9, 27, 12, 0, 0, TimeSpan.Zero);
+    // The IPC dispatcher uses the current clock; keep synthetic buckets in its window.
+    DateTimeOffset now = DateTimeOffset.FromUnixTimeSeconds(
+        DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 60 * 60);
     long second = now.ToUnixTimeSeconds();
     string appA = @"C:\APP\A.EXE", appB = @"C:\APP\B.EXE", appC = @"C:\APP\C.EXE";
     var store = new ApplicationTrafficPersistence(path, new ApplicationTrafficAccumulator());
