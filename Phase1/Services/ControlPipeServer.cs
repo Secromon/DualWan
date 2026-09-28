@@ -43,6 +43,10 @@ public interface IDualWanControlPlane
     Task<ControlResult> GetTelemetryStorageStatusAsync();
     Task<ControlResult> SetTelemetryStoragePolicyAsync(int? retentionDays, long? maximumBytes);
     Task<ControlResult> CleanTelemetryAsync();
+    Task<ControlResult> GetAppStatisticsSummaryAsync(string period, int limit);
+    Task<ControlResult> GetAppStatisticsDetailAsync(string appKey, string period);
+    Task<ControlResult> GetAppStatsRetentionAsync();
+    Task<ControlResult> SetAppStatsRetentionAsync(int minutes);
     Task<ControlResult> ReloadConfigAsync(CancellationToken cancellationToken);
     Task<ControlResult> SetWanConfigurationAsync(ControlWanSelection wan1, ControlWanSelection wan2,
         CancellationToken cancellationToken);
@@ -196,6 +200,10 @@ public sealed class ControlPipeServer : IAsyncDisposable
                 "gettelemetrystoragestatus" => await _controlPlane.GetTelemetryStorageStatusAsync(),
                 "settelemetrystoragepolicy" => await SetTelemetryStoragePolicyAsync(pipe, root),
                 "cleantelemetry" => await MutateAsync(pipe, _controlPlane.CleanTelemetryAsync),
+                "getappstatisticssummary" => await GetAppStatisticsSummaryAsync(root),
+                "getappstatisticsdetail" => await GetAppStatisticsDetailAsync(root),
+                "getappstatsretention" => await _controlPlane.GetAppStatsRetentionAsync(),
+                "setappstatsretention" => await SetAppStatsRetentionAsync(pipe, root),
                 "reloadconfig" => await MutateAsync(pipe, () => _controlPlane.ReloadConfigAsync(cancellationToken)),
                 "setwanconfiguration" => await SetWanConfigurationAsync(pipe, root, cancellationToken),
                 _ => ControlResult.Error("UNKNOWN_COMMAND", $"Unsupported command: {command}.")
@@ -316,6 +324,35 @@ public sealed class ControlPipeServer : IAsyncDisposable
         if (root.TryGetProperty("retentionDays", out var d) && d.ValueKind != JsonValueKind.Null) days = d.GetInt32();
         if (root.TryGetProperty("maximumBytes", out var b) && b.ValueKind != JsonValueKind.Null) bytes = b.GetInt64();
         return await _controlPlane.SetTelemetryStoragePolicyAsync(days, bytes);
+    }
+
+    private Task<ControlResult> GetAppStatisticsSummaryAsync(JsonElement root)
+    {
+        string period = root.TryGetProperty("period", out var p) && p.ValueKind == JsonValueKind.String
+            ? p.GetString() ?? "" : "";
+        int limit = 20;
+        if (root.TryGetProperty("limit", out var l) &&
+            (l.ValueKind != JsonValueKind.Number || !l.TryGetInt32(out limit)))
+            return Task.FromResult(ControlResult.Error("INVALID_LIMIT", "limit must be an integer from 1 to 100."));
+        return _controlPlane.GetAppStatisticsSummaryAsync(period, limit);
+    }
+
+    private Task<ControlResult> GetAppStatisticsDetailAsync(JsonElement root)
+    {
+        string period = root.TryGetProperty("period", out var p) && p.ValueKind == JsonValueKind.String
+            ? p.GetString() ?? "" : "";
+        string appKey = root.TryGetProperty("appKey", out var a) && a.ValueKind == JsonValueKind.String
+            ? a.GetString() ?? "" : "";
+        return _controlPlane.GetAppStatisticsDetailAsync(appKey, period);
+    }
+
+    private async Task<ControlResult> SetAppStatsRetentionAsync(NamedPipeServerStream pipe, JsonElement root)
+    {
+        if (!IsMutationAuthorized(pipe)) return ControlResult.Error("UNAUTHORIZED", "Administrator rights are required.");
+        if (!root.TryGetProperty("retentionMinutes", out var value) ||
+            value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out int minutes))
+            return ControlResult.Error("INVALID_RETENTION", "retentionMinutes must be a supported integer.");
+        return await _controlPlane.SetAppStatsRetentionAsync(minutes);
     }
 
     private async Task<ControlResult> SetWanConfigurationAsync(NamedPipeServerStream pipe, JsonElement root,

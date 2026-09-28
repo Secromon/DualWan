@@ -89,7 +89,7 @@ public partial class MainWindow : Window
         AboutVersion.Text = $"DualWAN {Assembly.GetExecutingAssembly().GetName().Version?.ToString(3)} — by GDM — GPLv3";
         VersionText.Text = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "";
         RulesGrid.ItemsSource = _rules;
-        GroupsGrid.ItemsSource = _groups;
+        InitializeGroupsView();
         InitializeApplicationsView();
         ApplicationsList.ItemsSource = _applicationView;
         LanguageSelect.ItemsSource = _loc.Packs;
@@ -165,8 +165,17 @@ public partial class MainWindow : Window
             ?? throw new IOException("The service closed the control pipe.");
         using var document = JsonDocument.Parse(response);
         if (!document.RootElement.GetProperty("success").GetBoolean())
-            throw new InvalidDataException("The service rejected the request.");
+        {
+            string code = document.RootElement.TryGetProperty("error", out var error) &&
+                error.TryGetProperty("code", out var value) ? value.GetString() ?? "" : "";
+            throw new ServiceRequestException(code);
+        }
         return document.RootElement.GetProperty("data").Clone();
+    }
+
+    private sealed class ServiceRequestException(string code) : IOException(code)
+    {
+        public string Code { get; } = code;
     }
 
     private void Render(JsonElement data)
@@ -241,6 +250,7 @@ public partial class MainWindow : Window
         if (MainTabs.SelectedIndex == 5) { await LoadStorageStatusAsync(); await LoadWanSettingsAsync(); }
         if (MainTabs.SelectedIndex == 6) { await RefreshRulesAsync(); await RefreshGroupsAsync(); }
         if (MainTabs.SelectedIndex == 7) RefreshHelp();
+        if (MainTabs.SelectedIndex == 8) await LoadStatisticsAsync();
     }
 
     // -----------------------------------------------------------------------------
@@ -306,6 +316,8 @@ public partial class MainWindow : Window
     private async Task RefreshGroupsAsync()
     {
         if (_groupsRefreshing) return;
+        string? selectedName = _groupOriginal?.Name;
+        bool keepDraft = GroupIsDirty() && !_groupSaving;
         _groupsRefreshing = true;
         RefreshGroupsButton.IsEnabled = false;
         GroupsStatus.Text = _loc.Text("groups.loading");
@@ -320,6 +332,7 @@ public partial class MainWindow : Window
                 string name = wan.GetProperty("name").GetString() ?? id;
                 _wans.Add(new WanChoice(id, $"{id} — {name}"));
             }
+            _groupEditorLoading = true;
             _groups.Clear();
             foreach (var group in data.GetProperty("groups").EnumerateArray())
             {
@@ -332,8 +345,9 @@ public partial class MainWindow : Window
                 _groups.Add(new GroupRow(name, wan, wanDisplay, mode, enabled, apps,
                     string.Format(_loc.Text("groups.appCount"), apps.Length),
                     _loc.Text(enabled ? "common.enabled" : "groups.disabled"))
-                    { PolicyDisplay = GroupPolicyLabel(wan, mode, enabled) });
+                    { PolicyDisplay = GroupPolicyLabel(wan, mode, true) });
             }
+            _groupEditorLoading = false;
             _currentPreset = data.GetProperty("currentPreset").GetString();
             string preset = PresetName(_currentPreset);
             CurrentPresetText.Text = $"{_loc.Text("presets.current")}: {preset}";
@@ -341,16 +355,28 @@ public partial class MainWindow : Window
             GroupsGrid.IsEnabled = true;
             AddGroupButton.IsEnabled = true;
             _groupsEverLoaded = true;
+            if (keepDraft)
+            {
+                _groupEditorLoading = true;
+                GroupsGrid.SelectedItem = _groups.FirstOrDefault(g => g.Name.Equals(selectedName, StringComparison.OrdinalIgnoreCase));
+                _groupEditorLoading = false;
+            }
+            else RestoreGroupSelection(selectedName);
+            UpdateGroupSave();
             RefreshApplications();
         }
         catch (Exception ex) when (ex is IOException or TimeoutException or OperationCanceledException or JsonException or InvalidDataException)
         {
+            _groupEditorLoading = true;
             _currentPreset = null;
             _groups.Clear();
             GroupsStatus.Text = _loc.Text("groups.offline");
             CurrentPresetText.Text = $"{_loc.Text("presets.current")}: {_loc.Text("common.unavailable")}";
             GroupsGrid.IsEnabled = false;
             AddGroupButton.IsEnabled = false;
+            _groupEditorLoading = false;
+            if (!keepDraft) ClearGroupEditor();
+            UpdateGroupSave();
             RefreshApplications();
         }
         finally
@@ -395,28 +421,23 @@ public partial class MainWindow : Window
         });
     }
 
-    private async void AddGroup_Click(object sender, RoutedEventArgs e)
-    {
-        var editor = new GroupEditorWindow(this, _wans, _groups, null) { Owner = this };
-        if (editor.ShowDialog() == true && editor.Result is not null) await ApplyGroupAsync(editor.Result);
-    }
+    private void AddGroup_Click(object sender, RoutedEventArgs e) => BeginNewGroup();
 
-    private async void EditGroup_Click(object sender, RoutedEventArgs e)
+    private void EditGroup_Click(object sender, RoutedEventArgs e)
     {
-        if ((sender as FrameworkElement)?.Tag is not GroupRow group) return;
-        var editor = new GroupEditorWindow(this, _wans, _groups, group) { Owner = this };
-        if (editor.ShowDialog() == true && editor.Result is not null) await ApplyGroupAsync(editor.Result);
+        if ((sender as FrameworkElement)?.Tag is GroupRow group) GroupsGrid.SelectedItem = group;
     }
 
     private async void DeleteGroup_Click(object sender, RoutedEventArgs e)
     {
-        if ((sender as FrameworkElement)?.Tag is not GroupRow group) return;
+        GroupRow? group = (sender as FrameworkElement)?.Tag as GroupRow ?? _groupOriginal;
+        if (group is null) return;
         if (MessageBox.Show(this, string.Format(_loc.Text("groups.deleteConfirm"), group.Name), "DualWAN",
                 MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
-        await RunWriteAsync(new
+        if (await RunWriteAsync(new
         {
             apiVersion = 1, requestId = Guid.NewGuid().ToString("N"), command = "deleteGroup", name = group.Name
-        });
+        })) ClearGroupEditor();
     }
 
     private async Task<bool> ApplyGroupAsync(GroupRow group)
@@ -428,6 +449,17 @@ public partial class MainWindow : Window
             command = "upsertGroup",
             group = new { name = group.Name, wan = group.Wan, mode = group.Mode, enabled = group.Enabled, applications = group.Applications }
         });
+    }
+
+    private Task<bool> ApplyEditedGroupAsync(GroupRow group, string? originalName)
+    {
+        object payload = originalName is null
+            ? new { name = group.Name, wan = group.Wan, mode = group.Mode,
+                enabled = group.Enabled, applications = group.Applications }
+            : new { originalName, name = group.Name, wan = group.Wan, mode = group.Mode,
+                enabled = group.Enabled, applications = group.Applications };
+        return RunWriteAsync(new { apiVersion = 1, requestId = Guid.NewGuid().ToString("N"),
+            command = "upsertGroup", group = payload }, groupWrite: true);
     }
 
     // Presets change group policy while individual rules retain precedence.
@@ -473,7 +505,8 @@ public partial class MainWindow : Window
     // -----------------------------------------------------------------------------
     // Mutating IPC: an elevated Dashboard helper performs writes
     // -----------------------------------------------------------------------------
-    private async Task<bool> RunWriteAsync(object request, bool wanConfiguration = false)
+    private async Task<bool> RunWriteAsync(object request, bool wanConfiguration = false, bool groupWrite = false,
+        bool appStatsRetention = false)
     {
         // The normal Dashboard process stays unelevated. UAC launches a short-lived
         // helper, and the Service still verifies the pipe client's administrator token.
@@ -492,7 +525,8 @@ public partial class MainWindow : Window
             await process.WaitForExitAsync();
             if (process.ExitCode == 0)
             {
-                if (MainTabs.SelectedIndex == 6) await RefreshApplicationsAfterWriteAsync();
+                if (groupWrite) { }
+                else if (MainTabs.SelectedIndex == 6) await RefreshApplicationsAfterWriteAsync();
                 else if (MainTabs.SelectedIndex is 2 or 3) await RefreshGroupsAsync();
                 else if (MainTabs.SelectedIndex == 5 && !wanConfiguration) await LoadStorageStatusAsync();
                 return true;
@@ -500,9 +534,10 @@ public partial class MainWindow : Window
             string message = process.ExitCode switch
             {
                 2 => _loc.Text("error.serviceOffline"),
-                3 => _loc.Text(wanConfiguration ? "settings.wan.error" : "error.invalidRule"),
+                3 => _loc.Text(groupWrite ? "groups.error.invalid" : wanConfiguration ? "settings.wan.error" : appStatsRetention ? "stats.retentionError" : "error.invalidRule"),
                 4 => _loc.Text("error.permissionDenied"),
-                5 => _loc.Text(wanConfiguration ? "settings.wan.error" : "error.saveFailed"),
+                5 => _loc.Text(wanConfiguration ? "settings.wan.error" : appStatsRetention ? "stats.retentionError" : "error.saveFailed"),
+                >= 20 and <= 25 when groupWrite => _loc.Text(GroupErrorKey(process.ExitCode)),
                 _ => _loc.Text("common.error")
             };
             MessageBox.Show(this, message, "DualWAN", MessageBoxButton.OK, MessageBoxImage.Error);
@@ -510,7 +545,8 @@ public partial class MainWindow : Window
         }
         catch (Win32Exception ex) when (ex.NativeErrorCode == 1223)
         {
-            RulesStatus.Text = _loc.Text("common.uacCancelled");
+            if (appStatsRetention) StatsStatus.Text = _loc.Text("common.uacCancelled");
+            else RulesStatus.Text = _loc.Text("common.uacCancelled");
             return false;
         }
         catch (Exception ex)
@@ -701,12 +737,12 @@ public partial class MainWindow : Window
     {
         bool compact=e.NewSize.Width<1020;SidebarColumn.Width=new GridLength(compact?68:220);
         Visibility visibility=compact?Visibility.Collapsed:Visibility.Visible;
-        BrandText.Visibility=VersionText.Visibility=NavDashboardText.Visibility=NavApplicationsText.Visibility=NavHistoryText.Visibility=NavGroupsText.Visibility=NavPresetsText.Visibility=NavSettingsText.Visibility=NavHelpText.Visibility=visibility;
+        BrandText.Visibility=VersionText.Visibility=NavDashboardText.Visibility=NavApplicationsText.Visibility=NavHistoryText.Visibility=NavStatisticsText.Visibility=NavGroupsText.Visibility=NavPresetsText.Visibility=NavSettingsText.Visibility=NavHelpText.Visibility=visibility;
     }
     private void UpdateNavigation()
     {
-        RadioButton selected=MainTabs.SelectedIndex switch{2=>NavGroups,3=>NavPresets,4=>NavHistory,5=>NavSettings,6=>NavApplications,7=>NavHelp,_=>NavDashboard};selected.IsChecked=true;
-        HeaderTitle.Text=MainTabs.SelectedIndex switch{2=>_loc.Text("tab.groups"),3=>_loc.Text("tab.presets"),4=>_loc.Text("tab.history"),5=>_loc.Text("tab.settings"),6=>_loc.Text("tab.applications"),7=>_loc.Text("tab.help"),_=>_loc.Text("tab.dashboard")};
+        RadioButton selected=MainTabs.SelectedIndex switch{2=>NavGroups,3=>NavPresets,4=>NavHistory,5=>NavSettings,6=>NavApplications,7=>NavHelp,8=>NavStatistics,_=>NavDashboard};selected.IsChecked=true;
+        HeaderTitle.Text=MainTabs.SelectedIndex switch{2=>_loc.Text("tab.groups"),3=>_loc.Text("tab.presets"),4=>_loc.Text("tab.history"),5=>_loc.Text("tab.settings"),6=>_loc.Text("tab.applications"),7=>_loc.Text("tab.help"),8=>_loc.Text("tab.statistics"),_=>_loc.Text("tab.dashboard")};
     }
     private void ApplyTheme()
     {
@@ -732,6 +768,7 @@ public partial class MainWindow : Window
                 Source = new Uri($"/DualWAN.Dashboard;component/Themes/{selected}.xaml", UriKind.Relative)
             };
         RedrawHistoryPanels();
+        RedrawStatisticsChart();
     }
     private static bool IsWindowsDarkTheme()
     {
@@ -739,15 +776,16 @@ public partial class MainWindow : Window
     }
     private void ApplyLanguage()
     {
-        DashboardTab.Header=_loc.Text("tab.dashboard");RulesTab.Header=_loc.Text("tab.rules");GroupsTab.Header=_loc.Text("tab.groups");PresetsTab.Header=_loc.Text("tab.presets");HistoryTab.Header=_loc.Text("tab.history");SettingsTab.Header=_loc.Text("tab.settings");ApplicationsTab.Header=_loc.Text("tab.applications");HelpTab.Header=_loc.Text("tab.help");
+        DashboardTab.Header=_loc.Text("tab.dashboard");RulesTab.Header=_loc.Text("tab.rules");GroupsTab.Header=_loc.Text("tab.groups");PresetsTab.Header=_loc.Text("tab.presets");HistoryTab.Header=_loc.Text("tab.history");SettingsTab.Header=_loc.Text("tab.settings");ApplicationsTab.Header=_loc.Text("tab.applications");HelpTab.Header=_loc.Text("tab.help");StatisticsTab.Header=_loc.Text("tab.statistics");
         HistoryTitle.Text=_loc.Text("history.title");HistoryRangeLabel.Text=_loc.Text("history.range");HistoryRefreshButton.Content=_loc.Text("history.refresh");HistoryWan1TrafficTitle.Text=HistoryWan2TrafficTitle.Text=_loc.Text("history.traffic");HistoryWan1QualityTitle.Text=HistoryWan2QualityTitle.Text=_loc.Text("history.quality");HistoryWan1Empty.Text=HistoryWan2Empty.Text=_loc.Text("history.emptyWan");RedrawHistoryPanels();
         SettingsTitle.Text=_loc.Text("settings.title");HistoricalSettingsTitle.Text=_loc.Text("settings.historical");RetentionLabel.Text=_loc.Text("settings.retention");CustomRetentionLabel.Text=_loc.Text("settings.customDays");MaximumSizeLabel.Text=_loc.Text("settings.maximumSize");LanguageLabel.Text=_loc.Text("settings.language");SaveSettingsButton.Content=_loc.Text("settings.save");CleanHistoryButton.Content=_loc.Text("settings.clean");
         WanConfigurationTitle.Text=_loc.Text("settings.wan.title");WanConfigurationDescription.Text=_loc.Text("settings.wan.description");Wan1InterfaceLabel.Text=Wan2InterfaceLabel.Text=_loc.Text("settings.wan.interface");Wan1FriendlyLabel.Text=Wan2FriendlyLabel.Text=_loc.Text("settings.wan.friendly");SaveWanConfigurationButton.Content=_loc.Text("settings.wan.save");
-        NavDashboardText.Text=_loc.Text("tab.dashboard");NavApplicationsText.Text=_loc.Text("tab.applications");NavHistoryText.Text=_loc.Text("tab.history");NavGroupsText.Text=_loc.Text("tab.groups");NavPresetsText.Text=_loc.Text("tab.presets");NavSettingsText.Text=_loc.Text("tab.settings");NavHelpText.Text=_loc.Text("tab.help");RefreshHelp();
+        NavDashboardText.Text=_loc.Text("tab.dashboard");NavApplicationsText.Text=_loc.Text("tab.applications");NavHistoryText.Text=_loc.Text("tab.history");NavStatisticsText.Text=_loc.Text("tab.statistics");NavGroupsText.Text=_loc.Text("tab.groups");NavPresetsText.Text=_loc.Text("tab.presets");NavSettingsText.Text=_loc.Text("tab.settings");NavHelpText.Text=_loc.Text("tab.help");RefreshHelp();
+        ApplyStatisticsLanguage();
         ApplicationsTitle.Text=_loc.Text("tab.applications");ApplicationsSubtitle.Text=_loc.Text("apps.subtitle");AddApplicationButton.Content=_loc.Text("apps.add");ApplicationsStatus.Text=_loc.Text("apps.configured");ApplicationsEmpty.Text=_loc.Text("apps.empty");ApplicationsSearchHint.Text=_loc.Text("apps.search");ApplicationsSearchEmpty.Text=_loc.Text("apps.searchEmpty");Application.Current.Resources["apps.edit"]=_loc.Text("common.edit");Application.Current.Resources["apps.remove"]=_loc.Text("apps.remove");Application.Current.Resources["apps.openFileLocation"]=_loc.Text("apps.openFileLocation");RefreshApplications();
         DashboardTitle.Text=_loc.Text("dashboard.title");DashboardSubtitle.Text=_loc.Text("dashboard.subtitle");Wan1RxLabel.Text=Wan2RxLabel.Text=_loc.Text("dashboard.download");Wan1TxLabel.Text=Wan2TxLabel.Text=_loc.Text("dashboard.upload");Wan1PingLabel.Text=Wan2PingLabel.Text=_loc.Text("dashboard.ping");Wan1LossLabel.Text=Wan2LossLabel.Text=_loc.Text("dashboard.loss");Wan1UptimeLabel.Text=Wan2UptimeLabel.Text=_loc.Text("dashboard.uptime");Wan1TotalsLabel.Text=Wan2TotalsLabel.Text=_loc.Text("dashboard.totals");
         RulesTitle.Text=_loc.Text("rules.title");RulesSubtitle.Text=_loc.Text("rules.subtitle");RefreshRulesButton.Content=_loc.Text("common.refresh");AddRuleButton.Content=_loc.Text("rules.add");RulesHelp.Text=_loc.Text("rules.help");RuleApplicationColumn.Header=_loc.Text("rules.application");RuleModeColumn.Header=_loc.Text("common.mode");RuleStatusColumn.Header=_loc.Text("common.status");RuleActionsColumn.Header=_loc.Text("common.actions");
-        GroupsTitle.Text=_loc.Text("groups.title");GroupsSubtitle.Text=_loc.Text("groups.subtitle");RefreshGroupsButton.Content=_loc.Text("common.refresh");AddGroupButton.Content=_loc.Text("groups.add");GroupsHelp.Text=_loc.Text("groups.help");GroupNameColumn.Header=_loc.Text("groups.name");GroupModeColumn.Header=_loc.Text("groups.policy");GroupStatusColumn.Header=_loc.Text("common.status");GroupApplicationsColumn.Header=_loc.Text("groups.applications");GroupActionsColumn.Header=_loc.Text("common.actions");
+        ApplyGroupsLanguage();
         PresetsTitle.Text=_loc.Text("presets.title");PresetsSubtitle.Text=_loc.Text("presets.subtitle");Preset1Description.Text=_loc.Text("presets.priority.desc");Preset2Description.Text=_loc.Text("presets.save.desc");Preset3Description.Text=_loc.Text("presets.only.desc");Preset4Description.Text=_loc.Text("presets.custom.desc");Preset1Apply.Content=Preset2Apply.Content=Preset3Apply.Content=Preset4Apply.Content=_loc.Text("common.apply");
         Preset1Title.Text=_loc.Text("presets.priority.name");Preset2Title.Text=_loc.Text("presets.save.name");Preset3Title.Text=_loc.Text("presets.only.name");Preset4Title.Text=_loc.Text("presets.custom.name");
         AppearanceTitle.Text=_loc.Text("settings.appearance");AppearanceDescription.Text=_loc.Text("settings.appearance.desc");ThemeLabel.Text=_loc.Text("settings.theme");LanguageSectionTitle.Text=_loc.Text("settings.language");LanguageDescription.Text=_loc.Text("settings.language.desc");AboutTitle.Text=_loc.Text("settings.about");AboutText.Text=_loc.Text("settings.about.text");StartupCheck.Content=_loc.Text("settings.startup");_trayOpen.Text=_loc.Text("tray.open");_trayExit.Text=_loc.Text("tray.exit");
@@ -757,7 +795,10 @@ public partial class MainWindow : Window
         foreach(ComboBoxItem item in MaximumSizeSelect.Items)if(item.Tag?.ToString()=="unlimited")item.Content=_loc.Text("settings.unlimited");
         Application.Current.Resources["tooltip.edit"]=_loc.Text("common.edit");Application.Current.Resources["tooltip.delete"]=_loc.Text("common.delete");Application.Current.Resources["tooltip.toggle"]=_loc.Text("rules.toggleTip");
         for(int i=0;i<_rules.Count;i++)_rules[i]=_rules[i] with{EnabledLabel=_loc.Text(_rules[i].Enabled?"common.enabled":"common.disabled")};
-        for(int i=0;i<_groups.Count;i++)_groups[i]=_groups[i] with{EnabledLabel=_loc.Text(_groups[i].Enabled?"common.enabled":"groups.disabled"),ApplicationsLabel=string.Format(_loc.Text("groups.appCount"),_groups[i].Applications.Count),PolicyDisplay=GroupPolicyLabel(_groups[i].Wan,_groups[i].Mode,_groups[i].Enabled)};
+        _groupEditorLoading = true;
+        for(int i=0;i<_groups.Count;i++)_groups[i]=_groups[i] with{EnabledLabel=_loc.Text(_groups[i].Enabled?"common.enabled":"groups.disabled"),ApplicationsLabel=string.Format(_loc.Text("groups.appCount"),_groups[i].Applications.Count),PolicyDisplay=GroupPolicyLabel(_groups[i].Wan,_groups[i].Mode,true)};
+        GroupsGrid.SelectedItem = _groups.FirstOrDefault(g => g.Name.Equals(_groupOriginal?.Name, StringComparison.OrdinalIgnoreCase));
+        _groupEditorLoading = false;
         RulesStatus.Text=_rulesRefreshing||(!_rulesEverLoaded&&RulesGrid.IsEnabled)?_loc.Text("rules.loading"):RulesGrid.IsEnabled?string.Format(_loc.Text("rules.loaded"),_rules.Count):_loc.Text("rules.offline");
         string preset=_currentPreset is null?_loc.Text("common.unavailable"):PresetName(_currentPreset);
         CurrentPresetText.Text=$"{_loc.Text("presets.current")}: {preset}";
@@ -915,153 +956,6 @@ public partial class MainWindow : Window
         if (!ApplicationPolicyView.HasActiveGroupPolicy(enabled, wan, mode)) return _loc.Text("groups.disabled");
         return string.Format(_loc.Text(mode.Equals("STRICT", StringComparison.OrdinalIgnoreCase) ? "apps.only" : "apps.prefer"),
             FriendlyWan(wan));
-    }
-
-    private sealed class GroupEditorWindow : Window
-    {
-        private readonly MainWindow _parent;
-        private readonly LocalizationService _loc;
-        private readonly TextBox _name = new();
-        private readonly ComboBox _wan = new();
-        private readonly ComboBox _mode = new();
-        private readonly CheckBox _enabled = new();
-        private readonly TextBox _applications = new() { AcceptsReturn = true, Height = 95, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
-        private readonly TextBlock _memberCount = new();
-        private readonly StackPanel _memberPreview = new();
-        private readonly HashSet<string> _otherApplications;
-        public GroupRow? Result { get; private set; }
-
-        private sealed record ModeChoice(string Id, string Label);
-
-        public GroupEditorWindow(MainWindow parent, IReadOnlyList<WanChoice> wans, IEnumerable<GroupRow> groups, GroupRow? existing)
-        {
-            _parent = parent;
-            _loc = parent._loc;
-            Title = existing is null ? _loc.Text("groups.add") : string.Format(_loc.Text("groups.editTitle"), existing.Name);
-            Width = 570; Height = 700; MinHeight = 560; WindowStartupLocation = WindowStartupLocation.CenterOwner;
-            ResizeMode = ResizeMode.CanResize;
-            SetResourceReference(BackgroundProperty, "BackgroundBrush");
-            SetResourceReference(ForegroundProperty, "TextPrimaryBrush");
-            _otherApplications = groups.Where(x => existing is null || !x.Name.Equals(existing.Name, StringComparison.OrdinalIgnoreCase))
-                .SelectMany(x => x.Applications).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            _name.Text = existing?.Name ?? ""; _name.IsEnabled = existing is null;
-            _wan.ItemsSource = wans; _wan.DisplayMemberPath = nameof(WanChoice.Display); _wan.SelectedValuePath = nameof(WanChoice.Id);
-            _wan.SelectedValue = existing?.Wan ?? wans.FirstOrDefault()?.Id;
-            _mode.ItemsSource = new[] { new ModeChoice("STRICT", _loc.Text("groups.onlyMode")),
-                new ModeChoice("FAILOVER", _loc.Text("groups.preferMode")) };
-            _mode.DisplayMemberPath = nameof(ModeChoice.Label); _mode.SelectedValuePath = nameof(ModeChoice.Id);
-            _mode.SelectedValue = existing?.Mode ?? "FAILOVER";
-            _enabled.IsChecked = existing?.Enabled ?? true;
-            _enabled.Content = _loc.Text("common.enabled");
-            _applications.Text = existing is null ? "" : string.Join(Environment.NewLine, existing.Applications);
-            SetContextTooltip(_enabled, _loc.Text("context.groupEnabled"));
-            SetContextTooltip(_wan, _loc.Text("context.groupPolicy"));
-            SetContextTooltip(_mode, _loc.Text("context.groupPolicy"));
-            SetContextTooltip(_applications, _loc.Text("context.groupMembership"));
-
-            var form = new StackPanel { Margin = new Thickness(24) };
-            form.Children.Add(FieldLabel(_loc.Text("groups.name"))); form.Children.Add(_name);
-            form.Children.Add(FieldLabel(_loc.Text("history.wan"))); form.Children.Add(_wan);
-            form.Children.Add(FieldLabel(_loc.Text("groups.policy"))); form.Children.Add(_mode);
-            var policyNote = new TextBlock { Text = _loc.Text("groups.policyNote"), TextWrapping = TextWrapping.Wrap,
-                Margin = new Thickness(0, 8, 0, 0) };
-            policyNote.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush");
-            form.Children.Add(policyNote);
-            form.Children.Add(FieldLabel(_loc.Text("groups.applicationsHint"))); form.Children.Add(_applications);
-            _memberCount.Margin = new Thickness(0, 12, 0, 6);
-            _memberCount.FontWeight = FontWeights.SemiBold;
-            form.Children.Add(_memberCount);
-            var members = new ScrollViewer { Content = _memberPreview, MaxHeight = 200,
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
-            form.Children.Add(members);
-            form.Children.Add(_enabled);
-            var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 22, 0, 0) };
-            var cancel = new Button { Content = _loc.Text("common.cancel"), Padding = new Thickness(16, 7, 16, 7), IsCancel = true };
-            var save = new Button { Content = _loc.Text("common.save"), Padding = new Thickness(16, 7, 16, 7), Margin = new Thickness(10, 0, 0, 0), IsDefault = true };
-            save.SetResourceReference(StyleProperty, "PrimaryButton");
-            save.Click += Save_Click; buttons.Children.Add(cancel); buttons.Children.Add(save); form.Children.Add(buttons);
-            Content = new ScrollViewer { Content = form, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
-            _applications.TextChanged += (_, _) => RefreshMemberPreview();
-            _wan.SelectionChanged += (_, _) => RefreshMemberPreview();
-            _mode.SelectionChanged += (_, _) => RefreshMemberPreview();
-            _enabled.Checked += (_, _) => RefreshMemberPreview();
-            _enabled.Unchecked += (_, _) => RefreshMemberPreview();
-            RefreshMemberPreview();
-        }
-
-        private void RefreshMemberPreview()
-        {
-            string[] processes = _applications.Text.Split(['\r', '\n'],
-                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            string wan = _wan.SelectedValue as string ?? "";
-            string mode = _mode.SelectedValue as string ?? "FAILOVER";
-            var members = GroupMemberPresentation.Build(processes.Select(process =>
-            {
-                ApplicationCatalogueEntry? known = _loc.FindApplication(process);
-                RuleRow? rule = _parent._rules.FirstOrDefault(x => x.Process.Equals(process, StringComparison.OrdinalIgnoreCase));
-                return new GroupMemberInput(process, known?.DisplayName,
-                    rule is null ? null : new PolicyInput(rule.Wan, rule.Mode, rule.Enabled));
-            }), new PolicyInput(wan, mode, _enabled.IsChecked == true));
-            _memberCount.Text = string.Format(_loc.Text("groups.appCount"), members.Count);
-            _memberPreview.Children.Clear();
-            foreach (GroupMemberState member in members)
-            {
-                string state = member.Effective.Source switch
-                {
-                    EffectivePolicySource.Individual => _loc.Text("packages.individualRule"),
-                    EffectivePolicySource.Group => _loc.Text("groups.inherits"),
-                    _ => _loc.Text("groups.disabled")
-                };
-                string policy = member.Effective.Source == EffectivePolicySource.Windows ? "" :
-                    _parent.GroupPolicyLabel(member.Effective.Wan!, member.Effective.Mode!, true);
-                var item = new StackPanel { Margin = new Thickness(0, 0, 0, 10) };
-                item.Children.Add(new TextBlock { Text = member.DisplayName, FontWeight = FontWeights.SemiBold,
-                    TextTrimming = TextTrimming.CharacterEllipsis });
-                var process = new TextBlock { Text = member.Process };
-                process.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush");
-                item.Children.Add(process);
-                var effective = new TextBlock { Text = policy.Length == 0 ? state : $"{state} · {policy}",
-                    TextWrapping = TextWrapping.Wrap };
-                effective.SetResourceReference(TextBlock.ForegroundProperty,
-                    member.Effective.Source == EffectivePolicySource.Windows ? "TextSecondaryBrush" : "AccentBrush");
-                item.Children.Add(effective);
-                _memberPreview.Children.Add(item);
-            }
-        }
-
-        private void Save_Click(object sender, RoutedEventArgs e)
-        {
-            string name = _name.Text.Trim();
-            if (string.IsNullOrWhiteSpace(name) || name.Length > 64 || name.IndexOfAny(['\\', '/', '\0']) >= 0)
-            { ShowError(_loc.Text("groups.invalidName")); return; }
-            string[] apps = _applications.Text.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            var unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (string app in apps)
-            {
-                if (!IsValidProcess(app)) { ShowError(string.Format(_loc.Text("groups.invalidExecutable"), app)); return; }
-                if (!unique.Add(app)) { ShowError(string.Format(_loc.Text("groups.duplicateApplication"), app)); return; }
-                if (_otherApplications.Contains(app)) { ShowError(string.Format(_loc.Text("groups.applicationInOtherGroup"), app)); return; }
-            }
-            if (_wan.SelectedItem is not WanChoice wan || _mode.SelectedValue is not string mode) return;
-            bool enabled = _enabled.IsChecked == true;
-            Result = new GroupRow(name, wan.Id, wan.Display, mode, enabled, apps,
-                string.Format(_loc.Text("groups.appCount"), apps.Length), _loc.Text(enabled ? "common.enabled" : "groups.disabled"))
-                { PolicyDisplay = _parent.GroupPolicyLabel(wan.Id, mode, enabled) };
-            DialogResult = true;
-        }
-
-        private static bool IsValidProcess(string process) => !string.IsNullOrWhiteSpace(process) && process.Length <= 260 &&
-            process.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) &&
-            Path.GetFileName(process).Equals(process, StringComparison.Ordinal) &&
-            process.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
-        private void ShowError(string message) => MessageBox.Show(this, message, "DualWAN", MessageBoxButton.OK, MessageBoxImage.Warning);
-        private static TextBlock FieldLabel(string text)
-        {
-            var label = new TextBlock { Text = text, Margin = new Thickness(0, 12, 0, 5) };
-            label.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush");
-            return label;
-        }
     }
 
     private sealed class RuleEditorWindow : Window

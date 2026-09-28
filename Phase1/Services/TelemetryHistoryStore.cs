@@ -19,6 +19,7 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
     private readonly IReadOnlyDictionary<string, NetBinder.Shared.Models.BindingMapping> _wans;
     private readonly WanHealthService _health;
     private readonly RedirectorService _redirector;
+    private readonly ApplicationTrafficPersistence? _appTraffic;
     private readonly CancellationTokenSource _cts = new();
     // Serializes writes, queries and maintenance on the shared history state.
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -28,8 +29,9 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
     private StoragePolicy _policy = new();
 
     public TelemetryHistoryStore(string path, IReadOnlyDictionary<string, NetBinder.Shared.Models.BindingMapping> wans,
-        WanHealthService health, RedirectorService redirector)
-    { _path = path; _wans = wans; _health = health; _redirector = redirector; }
+        WanHealthService health, RedirectorService redirector, ApplicationTrafficAccumulator? traffic = null)
+    { _path = path; _wans = wans; _health = health; _redirector = redirector;
+      if (traffic is not null) _appTraffic = new ApplicationTrafficPersistence(path, traffic, _gate); }
 
     private string ConnectionString => new SqliteConnectionStringBuilder { DataSource = _path, Mode = SqliteOpenMode.ReadWriteCreate }.ToString();
 
@@ -37,6 +39,7 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
         await InitializeAsync();
+        if (_appTraffic is not null) await _appTraffic.InitializeAsync();
         await AddEventAsync("SERVICE_START", null, null);
         await MaintainAsync();
         _worker = Task.Run(() => RunAsync(_cts.Token));
@@ -63,12 +66,29 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
         // A failed sample is logged locally and leaves the routing engine running.
         using var sample = new PeriodicTimer(TimeSpan.FromSeconds(5));
         DateTime nextMaintenance = DateTime.UtcNow.AddDays(1);
+        long nextAppFlush = DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 60 * 60 + 60;
+        DateTime nextAppMaintenance = DateTime.UtcNow.AddMinutes(15);
         try
         {
             while (await sample.WaitForNextTickAsync(ct))
             {
                 try { await WriteSampleAsync(); if (DateTime.UtcNow >= nextMaintenance) { await MaintainAsync(); nextMaintenance = DateTime.UtcNow.AddDays(1); } }
                 catch (Exception ex) { Console.WriteLine($"TELEMETRY DATABASE ERROR: {ex.GetType().Name}: {ex.Message}; routing continues"); }
+                if (_appTraffic is not null)
+                {
+                    long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    if (now >= nextAppFlush)
+                    {
+                        await _appTraffic.FlushAsync(DateTimeOffset.UtcNow,
+                            maximumBytes: _policy.MaximumBytes, ct: ct);
+                        nextAppFlush = now / 60 * 60 + 60;
+                    }
+                    if (DateTime.UtcNow >= nextAppMaintenance)
+                    {
+                        await _appTraffic.MaintainAsync(DateTimeOffset.UtcNow, _policy.MaximumBytes, ct);
+                        nextAppMaintenance = DateTime.UtcNow.AddMinutes(15);
+                    }
+                }
             }
         }
         catch (OperationCanceledException) { }
@@ -151,6 +171,8 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
         // Keep recent 5-second samples; compact older data to 1-, 5-, then
         // 15-minute buckets. Age retention applies to samples, buckets and events.
         // Size pruning prefers oldest aggregates and avoids recent raw samples.
+        if (_appTraffic is not null)
+            await _appTraffic.MaintainAsync(DateTimeOffset.UtcNow, _policy.MaximumBytes);
         await _gate.WaitAsync();
         try
         {
@@ -161,6 +183,43 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
             await Command(db,"PRAGMA wal_checkpoint(PASSIVE);");
         }
         finally{_gate.Release();}
+    }
+
+    public Task<AppTrafficSummary> QueryAppSummaryAsync(string period, int limit) =>
+        _appTraffic?.QuerySummaryAsync(period, limit) ??
+        Task.FromException<AppTrafficSummary>(new InvalidOperationException("Application statistics unavailable."));
+
+    public Task<AppTrafficDetail> QueryAppDetailAsync(string appKey, string period) =>
+        _appTraffic?.QueryDetailAsync(appKey, period) ??
+        Task.FromException<AppTrafficDetail>(new InvalidOperationException("Application statistics unavailable."));
+
+    public int? AppStatsRetentionMinutes => _appTraffic?.Enabled == true ? _appTraffic.RetentionMinutes : null;
+
+    public Task SetAppStatsRetentionAsync(int minutes) =>
+        _appTraffic?.Enabled == true
+            ? _appTraffic.SetRetentionAsync(minutes)
+            : Task.FromException(new InvalidOperationException("Application statistics unavailable."));
+
+    /// <summary>Call after relay producers have stopped; bounded best-effort final flush.</summary>
+    public async Task FlushFinalAppTrafficAsync()
+    {
+        if (_appTraffic is null || !_appTraffic.Enabled) return;
+        if (!await StopWorkerAsync())
+        {
+            Console.WriteLine("APP STATS SHUTDOWN FLUSH SKIPPED: history worker still active");
+            return;
+        }
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        do
+        {
+            await _appTraffic.FlushAsync(DateTimeOffset.UtcNow, sealCurrent: true,
+                maximumBytes: _policy.MaximumBytes, ct: timeout.Token);
+            if (_appTraffic.UncollectedSealedBuckets == 0) break;
+            try { await Task.Delay(50, timeout.Token); }
+            catch (OperationCanceledException) { break; }
+        } while (!timeout.IsCancellationRequested);
+        if (_appTraffic.PendingBatches > 0 || _appTraffic.UncollectedSealedBuckets > 0)
+            Console.WriteLine("APP STATS SHUTDOWN FLUSH INCOMPLETE; routing shutdown continues");
     }
 
     // Insert the aggregate and remove its source rows in one transaction.
@@ -178,5 +237,20 @@ public sealed class TelemetryHistoryStore : IAsyncDisposable
     private static async Task InsertEvent(SqliteConnection db,long ts,string type,string? wan,string? detail){await using var c=db.CreateCommand();c.CommandText="INSERT INTO events VALUES($t,$type,$wan,$detail)";c.Parameters.AddWithValue("$t",ts);c.Parameters.AddWithValue("$type",type);c.Parameters.AddWithValue("$wan",(object?)wan??DBNull.Value);c.Parameters.AddWithValue("$detail",(object?)detail??DBNull.Value);await c.ExecuteNonQueryAsync();}
     // Event persistence is deliberately isolated from its Service caller.
     public async Task AddEventAsync(string type,string? wan,string? detail){try{await _gate.WaitAsync();try{await using var db=new SqliteConnection(ConnectionString);await db.OpenAsync();await InsertEvent(db,DateTimeOffset.UtcNow.ToUnixTimeSeconds(),type,wan,detail);}finally{_gate.Release();}}catch(Exception ex){Console.WriteLine($"TELEMETRY EVENT ERROR: {ex.Message}");}}
-    public async ValueTask DisposeAsync(){_cts.Cancel();try{if(_worker is not null)await _worker;}catch(OperationCanceledException){}await AddEventAsync("SERVICE_STOP",null,null);_cts.Dispose();_gate.Dispose();}
+    private async Task<bool> StopWorkerAsync()
+    {
+        _cts.Cancel();
+        if (_worker is null) return true;
+        try { await _worker.WaitAsync(TimeSpan.FromSeconds(3)); return true; }
+        catch (TimeoutException) { Console.WriteLine("TELEMETRY WORKER STOP TIMEOUT; shutdown continues"); return false; }
+        catch (Exception ex) { Console.WriteLine($"TELEMETRY WORKER STOP ERROR: {ex.GetType().Name}"); return true; }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (!await StopWorkerAsync()) return;
+        await AddEventAsync("SERVICE_STOP", null, null);
+        _cts.Dispose();
+        _gate.Dispose();
+    }
 }

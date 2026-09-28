@@ -7,6 +7,9 @@
 - **Shared Windows processes:** A shared `svchost` process can represent several services, so application-level attribution may be ambiguous.
 - **Brief network activity:** Network Activity Detection samples process-owned TCP connections and UDP sockets. Very short connections may appear and disappear between samples.
 - **UDP ownership:** An owned UDP socket does not by itself prove that the process transmitted data during the scan.
+- **Application statistics coverage:** Figures cover only IPv4 TCP/UDP payload traffic routed through DualWAN relays. Windows passthrough, LAN bypass, IPv6, and other non-relay traffic are absent; this is not total application bandwidth.
+- **Statistics delay and retention:** Completed minute buckets are persisted, so the newest activity may appear after roughly one minute. Retention defaults to one hour; increasing it cannot reconstruct previously discarded history.
+- **LAN isolation:** Per-application LAN blocking is not implemented. Current NETWORK-layer attribution cannot confidently map every packet to its owner, especially with reused UDP endpoints. See [research findings](docs/LAN_ISOLATION_RESEARCH.md).
 - **Unsigned builds:** Current binaries and installer are unsigned, so Windows may display an untrusted-publisher warning.
 
-These limits describe the 1.0.0 implementation. They do not imply that traffic contents are captured by Network Activity Detection.
+These limits describe the current implementation. They do not imply that traffic contents are captured by Network Activity Detection or application statistics.

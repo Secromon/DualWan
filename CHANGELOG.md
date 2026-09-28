@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.1.0 — 2026
+
+### Added
+
+- Per-application statistics for DualWAN-routed IPv4 TCP/UDP payload traffic: top applications, upload/download, recorded WAN breakdown, TCP/UDP counts, bounded chart periods, and configurable retention (1 hour by default).
+- Additive minute-bucket SQLite persistence and bounded local IPC statistics queries.
+
+### Changed
+
+- Two-pane Groups interface with search, explicit editor, multi-application picker, individual-override indicator, and atomic rename.
+- More consistent Groups surfaces in Light and Dark themes.
+
+### Fixed
+
+- Fatal WinDivert packet-loop failures release interception and mark routing inactive, allowing new traffic to return toward native Windows handling. Existing flows may still break.
+
+### Documentation
+
+- Added LAN isolation attribution research; per-application LAN blocking remains unimplemented.
+
 ## 1.0.0 — 2026
 
 First public release. Developed by GDM under the GNU General Public License v3.0.

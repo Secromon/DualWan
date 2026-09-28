@@ -98,7 +98,7 @@ public partial class App : Application
             string request = Encoding.UTF8.GetString(Convert.FromBase64String(encodedRequest));
             using var requestDocument = JsonDocument.Parse(request);
             string command = requestDocument.RootElement.GetProperty("command").GetString() ?? "";
-            if (command is not ("upsertRule" or "deleteRule" or "upsertGroup" or "deleteGroup" or "applyPreset" or "setTelemetryStoragePolicy" or "cleanTelemetry" or "setWanConfiguration")) return 3;
+            if (command is not ("upsertRule" or "deleteRule" or "upsertGroup" or "deleteGroup" or "applyPreset" or "setTelemetryStoragePolicy" or "cleanTelemetry" or "setWanConfiguration" or "setAppStatsRetention")) return 3;
 
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             using var pipe = new NamedPipeClientStream(".", "DualWAN.Control", PipeDirection.InOut,
@@ -116,6 +116,12 @@ public partial class App : Application
                 "UNAUTHORIZED" => 4,
                 "PERSIST_FAILED" => 5,
                 "ENGINE_NOT_READY" => 2,
+                "GROUP_NAME_EXISTS" => 20,
+                "GROUP_NOT_FOUND" => 21,
+                "GROUP_MEMBERSHIP_CONFLICT" => 22,
+                "DUPLICATE_APPLICATION" => 23,
+                "INVALID_WAN" => 24,
+                "INVALID_MODE" => 25,
                 _ => 3
             };
         }

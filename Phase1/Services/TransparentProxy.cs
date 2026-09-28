@@ -22,6 +22,7 @@ public class TransparentProxy : IDisposable
     private bool _disposed;
     private readonly List<Task> _activeConnections = [];
     private readonly object _lock = new();
+    private readonly ApplicationTrafficAccumulator? _traffic;
 
     /// <summary>
     /// Delegate to lookup the original destination and target adapter index for a given client port.
@@ -35,9 +36,11 @@ public class TransparentProxy : IDisposable
 
     public bool IsRunning => _listenSocket != null && _cts != null && !_cts.IsCancellationRequested;
 
-    public TransparentProxy(Func<IPAddress, ushort, (IPEndPoint, int, long, FlowRecord)?> natLookup)
+    public TransparentProxy(Func<IPAddress, ushort, (IPEndPoint, int, long, FlowRecord)?> natLookup,
+        ApplicationTrafficAccumulator? traffic = null)
     {
         _natLookup = natLookup ?? throw new ArgumentNullException(nameof(natLookup));
+        _traffic = traffic;
     }
 
     /// <summary>
@@ -180,6 +183,7 @@ public class TransparentProxy : IDisposable
 
             var (originalRemoteEp, interfaceIndex, generation, report) = mapping.Value;
             flowReport = report;
+            var counter = _traffic?.CreateFlow(report.Executable, report.Wan);
             report.RelayAccepted();
             
             // Get local IP address associated with the target interface index
@@ -247,6 +251,7 @@ public class TransparentProxy : IDisposable
                 report.ConnectAttempted();
                 await targetSocket.ConnectAsync(originalRemoteEp, ct);
                 report.ConnectSucceeded((IPEndPoint)targetSocket.LocalEndPoint!);
+                counter?.TcpConnected();
             }
             catch (Exception ex)
             {
@@ -257,7 +262,7 @@ public class TransparentProxy : IDisposable
             }
 
             // Bidirectionally relay data
-            await RelayDataAsync(clientSocket, targetSocket, ct);
+            await RelayDataAsync(clientSocket, targetSocket, counter, ct);
         }
         catch (Exception ex)
         {
@@ -271,10 +276,11 @@ public class TransparentProxy : IDisposable
         }
     }
 
-    private static async Task RelayDataAsync(Socket client, Socket target, CancellationToken ct)
+    private static async Task RelayDataAsync(Socket client, Socket target,
+        ApplicationTrafficAccumulator.FlowCounter? counter, CancellationToken ct)
     {
-        var clientToTarget = RelayOneDirectionAsync(client, target, ct);
-        var targetToClient = RelayOneDirectionAsync(target, client, ct);
+        var clientToTarget = RelayOneDirectionAsync(client, target, counter is null ? null : counter.Upload, ct);
+        var targetToClient = RelayOneDirectionAsync(target, client, counter is null ? null : counter.Download, ct);
         await Task.WhenAny(clientToTarget, targetToClient);
 
         try { client.Close(); }
@@ -283,9 +289,12 @@ public class TransparentProxy : IDisposable
         catch (Exception ex) { Console.WriteLine($"[TransparentProxy] WAN relay close failed: {ex.Message}"); }
     }
 
-    private static async Task RelayOneDirectionAsync(Socket from, Socket to, CancellationToken ct)
+    private static async Task RelayOneDirectionAsync(Socket from, Socket to, Action<int>? counted, CancellationToken ct)
     {
         var buffer = new byte[8192];
+        // The delegate is created once per direction, never per payload chunk.
+        ValueTask<int> Send(ReadOnlyMemory<byte> data, CancellationToken token) => to.SendAsync(data, token);
+        Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<int>> sender = Send;
         try
         {
             while (!ct.IsCancellationRequested)
@@ -293,11 +302,27 @@ public class TransparentProxy : IDisposable
                 int read = await from.ReceiveAsync(buffer.AsMemory(), ct);
                 if (read == 0) break;
 
-                await to.SendAsync(buffer.AsMemory(0, read), ct);
+                await SendFullyAsync(buffer.AsMemory(0, read), sender, counted, ct);
             }
         }
         catch (OperationCanceledException) { Console.WriteLine("[TransparentProxy] Relay cancelled"); }
         catch (Exception ex) { Console.WriteLine($"[TransparentProxy] Relay failed: {ex.Message}"); }
+    }
+
+    /// <summary>Send all relay payload, counting only bytes accepted by the socket.</summary>
+    public static async Task SendFullyAsync(ReadOnlyMemory<byte> data,
+        Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<int>> send,
+        Action<int>? counted, CancellationToken ct = default)
+    {
+        while (!data.IsEmpty)
+        {
+            int sent = await send(data, ct);
+            if (sent <= 0 || sent > data.Length)
+                throw new IOException("TCP relay send made no valid progress.");
+            try { counted?.Invoke(sent); }
+            catch { /* Statistics must never affect relay delivery. */ }
+            data = data[sent..];
+        }
     }
 
     public void Dispose()

@@ -34,9 +34,14 @@ namespace NetBinder.Service.Services;
 /// </summary>
 public class RedirectorService : IDisposable
 {
+    private readonly object _lifecycleLock = new();
+    private readonly object _stopLock = new();
+    private readonly IWinDivertIo _io;
+    private readonly Action<RedirectorService>? _onFailure;
     private IntPtr _divertHandle = IntPtr.Zero;
     private Thread? _divertThread;
-    private bool _isRunning;
+    private volatile bool _isRunning;
+    private int _consecutiveSendFailures;
     private int _proxyPort;
     private readonly UdpRelay _udpRelay;
     private readonly LocalDestinationClassifier _localDestinations;
@@ -98,12 +103,23 @@ public class RedirectorService : IDisposable
     private const uint LOOPBACK_IFIDX = 1;
 
     public RedirectorService(UdpRelay udpRelay)
-        : this(udpRelay, new LocalDestinationClassifier(new WindowsLocalIpv4RouteSource())) { }
+        : this(udpRelay, new LocalDestinationClassifier(new WindowsLocalIpv4RouteSource()),
+            new NativeWinDivertIo()) { }
+
+    public RedirectorService(UdpRelay udpRelay, Action<RedirectorService> onFailure)
+        : this(udpRelay, new LocalDestinationClassifier(new WindowsLocalIpv4RouteSource()),
+            new NativeWinDivertIo(), onFailure) { }
 
     public RedirectorService(UdpRelay udpRelay, LocalDestinationClassifier localDestinations)
+        : this(udpRelay, localDestinations, new NativeWinDivertIo()) { }
+
+    public RedirectorService(UdpRelay udpRelay, LocalDestinationClassifier localDestinations,
+        IWinDivertIo io, Action<RedirectorService>? onFailure = null)
     {
         _udpRelay = udpRelay ?? throw new ArgumentNullException(nameof(udpRelay));
         _localDestinations = localDestinations ?? throw new ArgumentNullException(nameof(localDestinations));
+        _io = io ?? throw new ArgumentNullException(nameof(io));
+        _onFailure = onFailure;
     }
 
     /// <summary>
@@ -151,96 +167,114 @@ public class RedirectorService : IDisposable
     /// </summary>
     public bool Start(int proxyPort)
     {
-        if (_isRunning) return true;
-
-        _localDestinations.Refresh();
-        _proxyPort = proxyPort;
-        _isRunning = true;
-
-        string filter = $"(outbound and ip and ((tcp and tcp.DstPort != {proxyPort} and tcp.SrcPort != {proxyPort}) or (udp and udp.SrcPort != 67 and udp.SrcPort != 68 and udp.DstPort != 67 and udp.DstPort != 68))) or (loopback and ip and ((tcp and tcp.SrcPort == {proxyPort}) or udp))";
-
-        Console.WriteLine($"[RedirectorService] Opening WinDivert with filter: {filter}");
-
-        _divertHandle = WinDivertNative.WinDivertOpen(
-            filter,
-            WinDivertNative.WINDIVERT_LAYER_NETWORK,
-            0,
-            0
-        );
-
-        if (_divertHandle == IntPtr.Zero || _divertHandle == new IntPtr(-1))
+        lock (_lifecycleLock)
         {
-            int err = Marshal.GetLastWin32Error();
-            Console.WriteLine($"[RedirectorService] Failed to open WinDivert handle. Win32 Error: {err}");
-            _isRunning = false;
-            return false;
+            if (_isRunning) return true;
+            _localDestinations.Refresh();
+            _proxyPort = proxyPort;
+            string filter = $"(outbound and ip and ((tcp and tcp.DstPort != {proxyPort} and tcp.SrcPort != {proxyPort}) or (udp and udp.SrcPort != 67 and udp.SrcPort != 68 and udp.DstPort != 67 and udp.DstPort != 68))) or (loopback and ip and ((tcp and tcp.SrcPort == {proxyPort}) or udp))";
+            Console.WriteLine($"[RedirectorService] Opening WinDivert with filter: {filter}");
+            IntPtr handle = _io.Open(filter);
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1))
+            {
+                Console.WriteLine($"[RedirectorService] Failed to open WinDivert handle. Win32 Error: {_io.LastError}");
+                return false;
+            }
+            _divertHandle = handle;
+            try
+            {
+                _consecutiveSendFailures = 0;
+                _localRouteRefresh = new Timer(_ => _localDestinations.Refresh(), null,
+                    TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
+                _divertThread = new Thread(PacketLoop)
+                {
+                    IsBackground = true,
+                    Name = "NetBinderWinDivertThread"
+                };
+                _isRunning = true;
+                _divertThread.Start();
+            }
+            catch
+            {
+                ReleaseCapture();
+                _divertThread = null;
+                throw;
+            }
         }
-
-        _divertThread = new Thread(PacketLoop)
-        {
-            IsBackground = true,
-            Name = "NetBinderWinDivertThread"
-        };
-        _divertThread.Start();
-        _localRouteRefresh = new Timer(_ => _localDestinations.Refresh(), null,
-            TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
-
         Console.WriteLine("[RedirectorService] Started successfully.");
-        return true;
+        return _isRunning;
     }
 
     public void Stop()
     {
-        if (!_isRunning) return;
-        _isRunning = false;
-        _localRouteRefresh?.Dispose();
-        _localRouteRefresh = null;
-        Console.WriteLine("[RedirectorService] Stopping...");
-
-        if (_divertHandle != IntPtr.Zero)
+        lock (_stopLock)
         {
-            WinDivertNative.WinDivertClose(_divertHandle);
-            _divertHandle = IntPtr.Zero;
-        }
-
-        if (_divertThread != null)
-        {
-            if (!_divertThread.Join(TimeSpan.FromSeconds(3)))
+            bool wasRunning = ReleaseCapture();
+            if (!wasRunning && _divertThread is null) return;
+            Console.WriteLine("[RedirectorService] Stopping...");
+            Thread? thread = _divertThread;
+            if (thread is not null && thread != Thread.CurrentThread &&
+                !thread.Join(TimeSpan.FromSeconds(3)))
                 Console.WriteLine("[RedirectorService] Warning: Thread did not stop gracefully.");
             _divertThread = null;
-        }
 
-        foreach (var entry in _natTable.Values)
-            RemoveFlow(entry, FlowState.Closed, "engine stopped");
-        _natTable.Clear();
-        _relayTable.Clear();
-        foreach (var session in _udpTable.Values)
-            _udpRelay.Remove(session, "engine stopped", false);
-        _udpTable.Clear();
-        PrintSessionSummary();
-        Console.WriteLine("[RedirectorService] Stopped.");
+            foreach (var entry in _natTable.Values)
+                RemoveFlow(entry, FlowState.Closed, "engine stopped");
+            _natTable.Clear();
+            _relayTable.Clear();
+            foreach (var session in _udpTable.Values)
+                _udpRelay.Remove(session, "engine stopped", false);
+            _udpTable.Clear();
+            PrintSessionSummary();
+            Console.WriteLine("[RedirectorService] Stopped.");
+        }
+    }
+
+    // Detach the handle under one lock so Stop and fatal-loop cleanup cannot
+    // close it twice. Closing unblocks a pending WinDivertRecv.
+    private bool ReleaseCapture()
+    {
+        lock (_lifecycleLock)
+        {
+            bool wasRunning = _isRunning;
+            _isRunning = false;
+            IntPtr handle = _divertHandle;
+            _divertHandle = IntPtr.Zero;
+            Timer? timer = _localRouteRefresh;
+            _localRouteRefresh = null;
+            timer?.Dispose();
+            if (handle != IntPtr.Zero && handle != new IntPtr(-1))
+            {
+                if (!_io.Close(handle))
+                    Environment.FailFast($"WinDivertClose failed ({_io.LastError}); terminating to release process-owned interception handle.");
+                Console.WriteLine("[RedirectorService] WinDivert interception released");
+            }
+            return wasRunning;
+        }
     }
 
     private void PacketLoop()
     {
         const int bufferSize = 65536;
-        IntPtr pPacketBuffer = Marshal.AllocHGlobal(bufferSize);
+        IntPtr pPacketBuffer = IntPtr.Zero;
         WINDIVERT_ADDRESS addr = new WINDIVERT_ADDRESS();
-
+        int receiveFailures = 0;
         try
         {
+            pPacketBuffer = Marshal.AllocHGlobal(bufferSize);
             while (_isRunning)
             {
-                if (!WinDivertNative.WinDivertRecv(_divertHandle, pPacketBuffer, bufferSize, out uint recvLen, ref addr))
+                IntPtr handle = _divertHandle;
+                if (!_io.Receive(handle, pPacketBuffer, bufferSize, out uint recvLen, ref addr))
                 {
                     if (!_isRunning) break;
-                    int err = Marshal.GetLastWin32Error();
-                    if (err != 995) // ERROR_OPERATION_ABORTED (expected on close)
-                        Console.WriteLine($"[RedirectorService] WinDivertRecv failed. Error: {err}");
+                    int err = _io.LastError;
+                    if (err is 6 or 995 || ++receiveFailures >= 3)
+                        throw new IOException($"WinDivertRecv failed repeatedly or fatally: {err}");
                     Thread.Sleep(1);
                     continue;
                 }
-
+                receiveFailures = 0;
                 ProcessPacket(pPacketBuffer, recvLen, ref addr);
                 if (DateTime.UtcNow >= _nextSweepUtc)
                 {
@@ -251,12 +285,33 @@ public class RedirectorService : IDisposable
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[RedirectorService] Fatal error in packet loop: {ex}");
+            if (_isRunning) Console.WriteLine($"PACKET LOOP FAILURE: {ex}");
         }
         finally
         {
-            Marshal.FreeHGlobal(pPacketBuffer);
+            if (pPacketBuffer != IntPtr.Zero) Marshal.FreeHGlobal(pPacketBuffer);
+            if (ReleaseCapture())
+            {
+                Console.WriteLine("[RedirectorService] Routing engine inactive after packet-loop failure");
+                try { _onFailure?.Invoke(this); }
+                catch (Exception ex) { Console.WriteLine($"[RedirectorService] Failure notification failed: {ex.Message}"); }
+            }
         }
+    }
+
+    private void SendPacket(IntPtr packet, uint length, ref WINDIVERT_ADDRESS address)
+    {
+        if (!_isRunning) return;
+        if (_io.Send(_divertHandle, packet, length, out _, ref address))
+        {
+            _consecutiveSendFailures = 0;
+            return;
+        }
+        if (!_isRunning) return;
+        if (++_consecutiveSendFailures >= 3)
+            throw new IOException($"WinDivertSend failed repeatedly: {_io.LastError}");
+        if (_consecutiveSendFailures == 1)
+            Console.WriteLine($"[RedirectorService] WinDivertSend failed; monitoring consecutive failures: {_io.LastError}");
     }
 
     private unsafe void ProcessPacket(IntPtr pPacketBuffer, uint recvLen, ref WINDIVERT_ADDRESS addr)
@@ -273,7 +328,7 @@ public class RedirectorService : IDisposable
 
         if (ipVersion != 4)
         {
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
             return;
         }
 
@@ -288,7 +343,7 @@ public class RedirectorService : IDisposable
 
         if (ipProto != 6) // Not TCP
         {
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
             return;
         }
 
@@ -346,7 +401,7 @@ public class RedirectorService : IDisposable
             }
 
             // Re-inject (modified or not)
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
             return;
         }
 
@@ -356,7 +411,7 @@ public class RedirectorService : IDisposable
             // Leave directly reachable IPv4 traffic untouched before owner lookup or WAN policy.
             if (_localDestinations.IsLocalDestination(dstIp))
             {
-                WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+                SendPacket(pPacketBuffer, recvLen, ref addr);
                 return;
             }
 
@@ -475,12 +530,12 @@ public class RedirectorService : IDisposable
                 }
             }
 
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
         }
         else
         {
             // Inbound non-loopback: just pass through
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
         }
     }
 
@@ -522,7 +577,7 @@ public class RedirectorService : IDisposable
             }
         }
 
-        WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+        SendPacket(pPacketBuffer, recvLen, ref addr);
     }
 
     private unsafe void HandleUdp(byte* packet, uint recvLen, IntPtr pPacketBuffer, ref WINDIVERT_ADDRESS addr)
@@ -530,7 +585,7 @@ public class RedirectorService : IDisposable
         int ipHdrLen = (packet[0] & 0x0F) * 4;
         if (recvLen < ipHdrLen + 8)
         {
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
             return;
         }
 
@@ -556,26 +611,26 @@ public class RedirectorService : IDisposable
                 replySession.Touch();
                 WinDivertNative.WinDivertHelperCalcChecksums(pPacketBuffer, recvLen, ref addr, 0);
             }
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
             return;
         }
 
         if (!addr.Outbound)
         {
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
             return;
         }
 
         // Packets generated by the bound relay socket must leave through the selected WAN unchanged.
         if (_udpRelay.IsOutbound(srcIp, srcPort))
         {
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
             return;
         }
 
         if (_localDestinations.IsLocalDestination(dstIp))
         {
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
             return;
         }
 
@@ -590,7 +645,7 @@ public class RedirectorService : IDisposable
             var decision = ResolveRouting(exePath, dstIp);
             if (!decision.Matched)
             {
-                WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+                SendPacket(pPacketBuffer, recvLen, ref addr);
                 return;
             }
             long generation = Interlocked.Increment(ref _nextGeneration);
@@ -630,7 +685,7 @@ public class RedirectorService : IDisposable
         addr.SubIfIdx = 0;
         addr.SetLoopback(true);
         WinDivertNative.WinDivertHelperCalcChecksums(pPacketBuffer, recvLen, ref addr, 0);
-        WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+        SendPacket(pPacketBuffer, recvLen, ref addr);
     }
 
     private void ScheduleNatCleanup(NatEntry entry)
