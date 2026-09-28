@@ -26,4 +26,4 @@ FLOW/SOCKET metadata is non-retroactive: a socket created before observer startu
 
 Per-application LAN isolation remains **parked and not implemented**. The current NETWORK-layer architecture cannot reliably guarantee packet ownership for all required traffic, especially UDP. A future design must treat an unknown or ambiguous owner as **allow / fail open**, never guess a PID. It must also release interception if the packet-processing engine fails; existing flows may still break. IPv6, DNS through shared processes, multicast and broadcast require independent coverage analysis before any security claim.
 
-The research projects may remain in source for contributors, but production Service and Dashboard do not reference them and the installer does not include them.
+The experimental projects remain in development history for contributors. They are absent from the 1.1.0 source tree and installer; production Service and Dashboard do not reference them.
