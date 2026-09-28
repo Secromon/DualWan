@@ -2,16 +2,18 @@
 
 DualWAN is a Windows application that lets different programs on the same PC use different Internet connections. It can assign applications to one of two WAN connections, fall back to the other connection for new flows when the preferred WAN is unavailable, and leave local IPv4 traffic on normal Windows routing.
 
-DualWAN 1.0.0 is the first public release. Developed by GDM.
+DualWAN 1.1.0 is the current public feature release. Developed by GDM.
 
 ## What DualWAN does
 
 - Routes individual applications through WAN1 or WAN2.
 - Prefers one WAN with automatic fallback, or restricts an application to one WAN.
 - Applies shared policies through optional Groups.
+- Offers a two-pane Groups editor with search, membership selection, individual-override indicators, and atomic rename.
 - Leaves applications without a DualWAN policy on normal Windows routing.
 - Preserves access to local IPv4 resources such as NAS devices and printers.
 - Monitors WAN health and shows traffic and quality history.
+- Shows per-application statistics for traffic routed through DualWAN, with recorded WAN breakdown and configurable short history.
 - Assists with finding applications installed or active on this PC.
 
 ## What DualWAN does not do
@@ -20,7 +22,7 @@ DualWAN does not combine the bandwidth of two connections. It is not bonding, MP
 
 ## Main features
 
-The Dashboard shows the two WANs and service status. Applications configures individual routing choices. Groups provides shared policies, and Profiles applies predefined Group configurations. History shows download, upload, latency, and packet loss for both WANs over 1 hour, 24 hours, 7 days, or 30 days. Settings includes appearance, language, and history retention.
+The Dashboard shows the two WANs and service status. Applications configures individual routing choices. Groups provides shared policies, and Profiles applies predefined Group configurations. History shows WAN download, upload, latency, and packet loss. Statistics shows aggregate routed traffic by application. Settings includes appearance, language, and history retention.
 
 ## How routing works
 
@@ -39,11 +41,11 @@ Add an executable, choose a running application, or use assisted detection. The 
 
 ## Groups
 
-Group membership is optional. A Group policy applies to a member without an individual rule. An individual rule always takes priority. Detection may suggest a Group but does not silently add applications to it.
+Group membership is optional. A Group policy applies to a member without an individual rule. An individual rule always takes priority. The two-pane Groups page supports search, an explicit editor, a multi-application membership picker, an individual-override indicator, and atomic rename. Detection may suggest a Group but does not silently add applications to it.
 
 ## Failover
 
-The Service checks WAN health. With a Prefer policy, it can select the other healthy WAN for a new flow when the preferred WAN is unavailable. With an Only policy, the flow does not automatically switch. Existing connections are not migrated.
+The Service checks WAN health. With a Prefer policy, it can select the other healthy WAN for a new flow when the preferred WAN is unavailable. With an Only policy, the flow does not automatically switch. Existing connections are not migrated. If the WinDivert packet-processing engine fails fatally, DualWAN releases interception and marks routing inactive, returning new traffic toward native Windows behavior; existing flows may still break.
 
 ## Local network access
 
@@ -56,6 +58,10 @@ Assisted detection uses local application information. Network Activity Detectio
 ## History
 
 History displays both WANs' download, upload, latency, and packet loss over 1 hour, 24 hours, 7 days, or 30 days. The Service stores historical telemetry in SQLite.
+
+## Application statistics
+
+Statistics displays top applications, upload/download totals, actual WAN1/WAN2 breakdown, TCP connection and UDP session counts, and a traffic chart for 1 hour, 24 hours, 7 days, or 30 days. Retention defaults to 1 hour and can be set to 24 hours, 7 days, or 30 days. These figures cover only IPv4 TCP/UDP payload traffic routed through DualWAN relays; Windows passthrough, LAN bypass, IPv6 and non-relay traffic are excluded. The feature stores minute-level aggregates, not destination or connection histories.
 
 ## Requirements
 
@@ -81,7 +87,7 @@ On a fresh installation, open **Settings → WAN configuration** and explicitly 
 
 ## Privacy
 
-Routing and application detection run locally; neither requires cloud processing. Network Activity Detection identifies processes using network connections without inspecting the content of those communications. See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for attribution limits.
+Routing and application detection run locally; neither requires cloud processing. Network Activity Detection identifies processes using network connections without inspecting the content of those communications. Application statistics store aggregate application identity, WAN, minute bucket, byte and TCP/UDP activity counts; they do not store destination histories or packet contents. See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for attribution limits.
 
 ## Known limitations
 
